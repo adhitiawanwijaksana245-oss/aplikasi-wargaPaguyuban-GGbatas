@@ -1,0 +1,8 @@
+{
+  "name": "Remix Aplikasi Warga",
+  "description": "Aplikasi Paguyuban Warga RT 005 / RW 011 Mulyaharja terkoneksi spreadsheet real-time untuk Kas RT, Pengurus, Undangan, Galeri, dan Aspirasi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
