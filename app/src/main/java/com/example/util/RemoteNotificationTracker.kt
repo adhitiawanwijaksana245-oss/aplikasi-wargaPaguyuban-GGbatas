@@ -49,9 +49,10 @@ object RemoteNotificationTracker {
     }
 
     private fun buildUndanganMessage(item: UndanganItem): String {
+        val formattedDate = IndonesianDateHelper.formatFullDate(item.tanggal)
         if (item.isPengumuman) {
             val detail = item.cleanKeterangan
-            val meta = listOf(item.tanggal, item.lokasi)
+            val meta = listOf(formattedDate, item.lokasi)
                 .filter { it.isNotBlank() && it != "-" }
                 .joinToString(" • ")
             return when {
@@ -61,7 +62,7 @@ object RemoteNotificationTracker {
                 else -> "Pengumuman terbaru dari Pengurus RT 005."
             }
         } else {
-            val jadwal = listOf(item.tanggal, item.waktu)
+            val jadwal = listOf(formattedDate, item.waktu)
                 .filter { it.isNotBlank() && it != "-" }
                 .joinToString(" ")
             val lokasiPart = if (item.lokasi.isNotBlank() && item.lokasi != "-") " di ${item.lokasi}" else ""

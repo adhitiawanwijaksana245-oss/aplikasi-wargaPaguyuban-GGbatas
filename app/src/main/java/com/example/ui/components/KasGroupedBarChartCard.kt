@@ -47,8 +47,8 @@ fun KasGroupedBarChartCard(
     }
 
     val initialStartIndex = remember(chartData) {
-        val jan2026Idx = chartData.indexOfFirst { it.periodeBulan == "2026-01" }
-        if (jan2026Idx >= 0) jan2026Idx else 0
+        val dec2025Idx = chartData.indexOfFirst { it.periodeBulan == "2025-12" }
+        if (dec2025Idx >= 0) dec2025Idx else 0
     }
 
     var selectedIndex by remember(chartData) {

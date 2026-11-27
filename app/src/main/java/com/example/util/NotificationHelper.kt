@@ -64,66 +64,86 @@ object NotificationHelper {
             ?: Settings.System.DEFAULT_NOTIFICATION_URI
     }
 
+    fun getConfiguredNotificationSoundUri(context: Context): Uri? {
+        return NotificationToneManager.resolveSoundUri(context)
+    }
+
+    fun resolveActiveChannelId(context: Context, baseChannelId: String): String {
+        val pref = NotificationToneManager.getPreference(context)
+        return NotificationToneManager.buildChannelId(baseChannelId, pref.channelRevision)
+    }
+
+    fun recreateNotificationChannelsForToneChange(context: Context) {
+        initNotificationChannels(context)
+    }
+
     fun initNotificationChannels(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val tonePref = NotificationToneManager.getPreference(context)
 
-            // Hapus channel versi lama agar seluruh HP menggunakan suara notifikasi bawaan masing-masing perangkat
-            legacyChannels.forEach { oldId ->
+            // Hapus channel versi lama & revisi sebelumnya agar perubahan nada langsung aktif di perangkat ini
+            val allBaseChannels = listOf(CHANNEL_BERITA, CHANNEL_ASPIRASI, CHANNEL_KAS, CHANNEL_PENGINGAT)
+            val staleChannelIds = legacyChannels + allBaseChannels.flatMap { baseId ->
+                NotificationToneManager.previousChannelIds(baseId, tonePref.channelRevision)
+            }
+            staleChannelIds.forEach { oldId ->
                 try {
                     manager.deleteNotificationChannel(oldId)
                 } catch (_: Exception) {
                 }
             }
 
-            val soundUri = getDefaultNotificationSoundUri()
+            val soundUri = NotificationToneManager.resolveSoundUri(context, tonePref)
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_NOTIFICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                 .build()
 
+            fun NotificationChannel.applyTonePreference() {
+                enableVibration(true)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                if (soundUri != null) {
+                    setSound(soundUri, audioAttributes)
+                } else {
+                    setSound(null, null)
+                }
+            }
+
             val channelBerita = NotificationChannel(
-                CHANNEL_BERITA,
+                resolveActiveChannelId(context, CHANNEL_BERITA),
                 "Pengumuman & Undangan Warga",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Notifikasi pengumuman dan undangan kegiatan RT 005 Mulyaharja"
-                enableVibration(true)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                setSound(soundUri, audioAttributes)
+                applyTonePreference()
             }
 
             val channelAspirasi = NotificationChannel(
-                CHANNEL_ASPIRASI,
+                resolveActiveChannelId(context, CHANNEL_ASPIRASI),
                 "Masukan, Saran & Kritik Warga",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Pemberitahuan masukan, saran, kritik baru, dan tanggapan pengurus RT"
-                enableVibration(true)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                setSound(soundUri, audioAttributes)
+                applyTonePreference()
             }
 
             val channelKas = NotificationChannel(
-                CHANNEL_KAS,
+                resolveActiveChannelId(context, CHANNEL_KAS),
                 "Kas & Keuangan RT",
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
                 description = "Laporan transaksi kas dan transparansi keuangan warga"
-                enableVibration(true)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                setSound(soundUri, audioAttributes)
+                applyTonePreference()
             }
 
             val channelPengingat = NotificationChannel(
-                CHANNEL_PENGINGAT,
+                resolveActiveChannelId(context, CHANNEL_PENGINGAT),
                 "Mode Pengingat Rapat & Gotong Royong",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Pengingat terjadwal dari pengurus RT untuk acara rapat atau gotong royong warga"
-                enableVibration(true)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                setSound(soundUri, audioAttributes)
+                applyTonePreference()
             }
 
             manager.createNotificationChannel(channelBerita)
@@ -190,7 +210,12 @@ object NotificationHelper {
                 NotificationCompat.CATEGORY_MESSAGE
             }
 
-            val builder = NotificationCompat.Builder(context, channelId)
+            val tonePref = NotificationToneManager.getPreference(context)
+            val activeChannelId = resolveActiveChannelId(context, channelId)
+            val configuredSoundUri = NotificationToneManager.resolveSoundUri(context, tonePref)
+            val isSilentVibrate = !silent && tonePref.option == NotificationToneOption.SILENT_VIBRATE
+
+            val builder = NotificationCompat.Builder(context, activeChannelId)
                 .setSmallIcon(R.drawable.ic_launcher_foreground_img)
                 .setContentTitle(title)
                 .setContentText(message)
@@ -204,10 +229,14 @@ object NotificationHelper {
                 .setSilent(silent)
 
             if (!silent) {
-                // Gunakan nada dering / suara notifikasi & getaran bawaan pengaturan masing-masing HP
-                builder.setDefaults(NotificationCompat.DEFAULT_SOUND or NotificationCompat.DEFAULT_VIBRATE)
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                    builder.setSound(getDefaultNotificationSoundUri())
+                if (isSilentVibrate) {
+                    builder.setSound(null)
+                    builder.setDefaults(NotificationCompat.DEFAULT_VIBRATE)
+                } else {
+                    builder.setDefaults(NotificationCompat.DEFAULT_VIBRATE)
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                        builder.setSound(configuredSoundUri ?: getDefaultNotificationSoundUri())
+                    }
                 }
             }
 

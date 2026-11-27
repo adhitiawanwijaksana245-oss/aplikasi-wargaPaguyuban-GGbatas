@@ -35,6 +35,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.example.data.model.PengurusAccount
+import com.example.data.model.UserRole
 import com.example.data.source.GoogleAppsScriptTemplate
 import com.example.ui.theme.GreenIncome
 import com.example.ui.theme.NavyPrimary
@@ -49,8 +51,9 @@ import java.util.Locale
 fun AuthorityPasswordDialog(
     errorMessage: String?,
     onDismiss: () -> Unit,
-    onSubmit: (String) -> Unit
+    onSubmit: (username: String, password: String) -> Unit
 ) {
+    var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
 
@@ -66,29 +69,29 @@ fun AuthorityPasswordDialog(
         },
         title = {
             Text(
-                text = "Otoritas Pengurus RT",
+                text = "Password Otoritas",
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp
             )
         },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    text = "Akses edit, tambah, dan hapus hanya untuk Pengurus dan Admin. Masukkan password otoritas:",
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("Username") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("authority_username_input")
                 )
-                Spacer(modifier = Modifier.height(14.dp))
-                Text(
-                    text = "Password Otoritas",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Spacer(modifier = Modifier.height(6.dp))
                 OutlinedTextField(
                     value = password,
                     onValueChange = { password = it },
+                    label = { Text("Password") },
                     singleLine = true,
                     visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -112,17 +115,79 @@ fun AuthorityPasswordDialog(
         },
         confirmButton = {
             Button(
-                onClick = { onSubmit(password) },
+                onClick = { onSubmit(username, password) },
                 enabled = password.isNotBlank(),
                 modifier = Modifier.testTag("authority_submit_button")
             ) {
-                Text("Buka Akses")
+                Text("Konfirmasi")
             }
         },
         dismissButton = {
             TextButton(
                 onClick = onDismiss,
                 modifier = Modifier.testTag("authority_cancel_button")
+            ) {
+                Text("Batal")
+            }
+        }
+    )
+}
+
+@Composable
+fun LogoutAuthorityDialog(
+    currentRole: UserRole,
+    activeDisplayName: String = "",
+    onDismiss: () -> Unit,
+    onConfirmLogout: () -> Unit
+) {
+    val roleLabel = when (currentRole) {
+        UserRole.ADMIN_UTAMA -> "Admin"
+        UserRole.PENGURUS -> "Pengurus"
+        UserRole.WARGA -> "Warga"
+    }
+    val cleanDisplayName = activeDisplayName.trim()
+    val bodyText = if (cleanDisplayName.isNotBlank() && !cleanDisplayName.equals(roleLabel, ignoreCase = true)) {
+        "Apakah Anda ingin keluar dari sesi $cleanDisplayName ($roleLabel) dan kembali ke mode Warga?"
+    } else {
+        "Apakah Anda ingin keluar dari mode $roleLabel dan kembali ke mode Warga?"
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Icon(
+                imageVector = Icons.Filled.Logout,
+                contentDescription = null,
+                tint = NavyPrimary,
+                modifier = Modifier.size(30.dp)
+            )
+        },
+        title = {
+            Text(
+                text = "Keluar dari Mode $roleLabel",
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp
+            )
+        },
+        text = {
+            Text(
+                text = bodyText,
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirmLogout,
+                modifier = Modifier.testTag("logout_authority_confirm_button")
+            ) {
+                Text("Keluar ke Mode Warga")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("logout_authority_cancel_button")
             ) {
                 Text("Batal")
             }
@@ -895,6 +960,506 @@ fun ChangePasswordDialog(
                 ) {
                     Text("Simpan Password")
                 }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Batal")
+            }
+        }
+    )
+}
+
+@Composable
+fun PengurusAccountsDialog(
+    accounts: List<PengurusAccount>,
+    onDismiss: () -> Unit,
+    onSaveAccount: (PengurusAccount) -> Pair<Boolean, String>,
+    onToggleActive: (accountId: String, aktif: Boolean) -> Unit,
+    onDeleteAccount: (accountId: String) -> Unit
+) {
+    var editingAccount by remember { mutableStateOf<PengurusAccount?>(null) }
+    var showForm by remember { mutableStateOf(false) }
+    var revealedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.84f)
+                .padding(vertical = 12.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(20.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                        Icon(
+                            imageVector = Icons.Outlined.ManageAccounts,
+                            contentDescription = null,
+                            tint = NavyPrimary,
+                            modifier = Modifier.size(26.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = "Pengaturan Akun Pengurus",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp
+                            )
+                            Text(
+                                text = "Khusus Admin Induk • Buat, aktifkan & nonaktifkan akses pengurus",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = {
+                        editingAccount = null
+                        showForm = true
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("add_pengurus_account_button")
+                ) {
+                    Icon(Icons.Filled.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Tambah Akun Pengurus")
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                if (accounts.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(16.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.SupervisorAccount,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.outline,
+                                modifier = Modifier.size(48.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Belum ada akun pengurus",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Buat username & password unik untuk setiap pengurus agar akses & nama aslinya tercatat.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        items(accounts, key = { it.id }) { acc ->
+                            val isPasswordShown = acc.id in revealedIds
+                            Card(
+                                shape = RoundedCornerShape(12.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (acc.aktif) {
+                                        Color(0xFFF0FDF4)
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                                    }
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("pengurus_account_card_${acc.id}")
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = acc.namaAsli,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 14.sp,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "Username: ${acc.username}",
+                                                fontSize = 12.sp,
+                                                color = NavyPrimary,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        }
+
+                                        Surface(
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = if (acc.aktif) Color(0xFFDCFCE7) else Color(0xFFFEE2E2)
+                                        ) {
+                                            Text(
+                                                text = if (acc.aktif) "Aktif" else "Nonaktif",
+                                                color = if (acc.aktif) Color(0xFF166534) else Color(0xFF991B1B),
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                            )
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                text = "Password: ${if (isPasswordShown) acc.password else "••••••••"}",
+                                                fontSize = 12.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            IconButton(
+                                                onClick = {
+                                                    revealedIds = if (isPasswordShown) {
+                                                        revealedIds - acc.id
+                                                    } else {
+                                                        revealedIds + acc.id
+                                                    }
+                                                },
+                                                modifier = Modifier.size(32.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = if (isPasswordShown) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
+                                                    contentDescription = if (isPasswordShown) "Sembunyikan password" else "Lihat password",
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                        }
+
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Switch(
+                                                checked = acc.aktif,
+                                                onCheckedChange = { checked ->
+                                                    onToggleActive(acc.id, checked)
+                                                },
+                                                modifier = Modifier.testTag("pengurus_account_switch_${acc.id}")
+                                            )
+                                            IconButton(
+                                                onClick = {
+                                                    editingAccount = acc
+                                                    showForm = true
+                                                },
+                                                modifier = Modifier.size(36.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.Edit,
+                                                    contentDescription = "Edit Akun",
+                                                    tint = NavyPrimary,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
+                                            IconButton(
+                                                onClick = { onDeleteAccount(acc.id) },
+                                                modifier = Modifier.size(36.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.Delete,
+                                                    contentDescription = "Hapus Akun",
+                                                    tint = MaterialTheme.colorScheme.error,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Tutup")
+                }
+            }
+        }
+    }
+
+    if (showForm) {
+        PengurusAccountFormDialog(
+            initial = editingAccount,
+            onDismiss = { showForm = false },
+            onSave = { account ->
+                val result = onSaveAccount(account)
+                if (result.first) {
+                    showForm = false
+                }
+                result
+            }
+        )
+    }
+}
+
+@Composable
+private fun PengurusAccountFormDialog(
+    initial: PengurusAccount?,
+    onDismiss: () -> Unit,
+    onSave: (PengurusAccount) -> Pair<Boolean, String>
+) {
+    var namaAsli by remember(initial) { mutableStateOf(initial?.namaAsli ?: "") }
+    var username by remember(initial) { mutableStateOf(initial?.username ?: "") }
+    var password by remember(initial) { mutableStateOf(initial?.password ?: "") }
+    var aktif by remember(initial) { mutableStateOf(initial?.aktif ?: true) }
+    var passwordVisible by remember { mutableStateOf(false) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = if (initial == null) "Buat Akun Pengurus" else "Edit Akun Pengurus",
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = namaAsli,
+                    onValueChange = {
+                        namaAsli = it
+                        errorMsg = null
+                    },
+                    label = { Text("Nama Asli Pengurus *") },
+                    placeholder = { Text("Contoh: Bapak Budi Santoso") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("account_nama_asli_input")
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = {
+                        username = it
+                        errorMsg = null
+                    },
+                    label = { Text("Username *") },
+                    placeholder = { Text("Contoh: budi_rt05") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("account_username_input")
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = {
+                        password = it
+                        errorMsg = null
+                    },
+                    label = { Text("Password *") },
+                    singleLine = true,
+                    visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                            Icon(
+                                imageVector = if (passwordVisible) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
+                                contentDescription = if (passwordVisible) "Sembunyikan password" else "Tampilkan password"
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("account_password_input")
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = if (aktif) "Status Akun: Aktif" else "Status Akun: Nonaktif",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Switch(
+                        checked = aktif,
+                        onCheckedChange = { aktif = it },
+                        modifier = Modifier.testTag("account_aktif_switch")
+                    )
+                }
+                if (errorMsg != null) {
+                    Text(
+                        text = errorMsg.orEmpty(),
+                        color = MaterialTheme.colorScheme.error,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val acc = PengurusAccount(
+                        id = initial?.id ?: "",
+                        namaAsli = namaAsli.trim(),
+                        username = username.trim(),
+                        password = password.trim(),
+                        aktif = aktif,
+                        createdAt = initial?.createdAt ?: System.currentTimeMillis()
+                    )
+                    val (ok, msg) = onSave(acc)
+                    if (!ok) {
+                        errorMsg = msg
+                    }
+                },
+                enabled = namaAsli.isNotBlank() && username.isNotBlank() && password.isNotBlank(),
+                modifier = Modifier.testTag("save_pengurus_account_button")
+            ) {
+                Text("Simpan Akun")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Batal")
+            }
+        }
+    )
+}
+
+@Composable
+fun SplashDurationDialog(
+    currentDurationMs: Long,
+    onDismiss: () -> Unit,
+    onSaveSeconds: (Int) -> Unit
+) {
+    val initialSeconds = remember(currentDurationMs) {
+        (currentDurationMs / 1000L).toInt().coerceIn(1, 15)
+    }
+    var secondsText by remember(initialSeconds) { mutableStateOf(initialSeconds.toString()) }
+    val presetSeconds = listOf(2, 3, 4, 5, 7, 10)
+    val parsedSeconds = secondsText.toIntOrNull()
+    val isValid = parsedSeconds != null && parsedSeconds in 1..15
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Icon(
+                imageVector = Icons.Outlined.Timer,
+                contentDescription = null,
+                tint = NavyPrimary,
+                modifier = Modifier.size(30.dp)
+            )
+        },
+        title = {
+            Text(
+                text = "Durasi Layar Pembuka (Splash)",
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Atur berapa detik gambar pembuka tampil saat aplikasi pertama kali dibuka (1 - 15 detik).",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    presetSeconds.take(3).forEach { sec ->
+                        FilterChip(
+                            selected = parsedSeconds == sec,
+                            onClick = { secondsText = sec.toString() },
+                            label = { Text("$sec dtk", fontSize = 12.sp) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    presetSeconds.drop(3).forEach { sec ->
+                        FilterChip(
+                            selected = parsedSeconds == sec,
+                            onClick = { secondsText = sec.toString() },
+                            label = { Text("$sec dtk", fontSize = 12.sp) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = secondsText,
+                    onValueChange = { input ->
+                        secondsText = input.filter { it.isDigit() }.take(2)
+                    },
+                    label = { Text("Durasi Custom (Detik)") },
+                    suffix = { Text("detik") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    isError = !isValid,
+                    supportingText = if (!isValid) {
+                        { Text("Masukkan angka antara 1 sampai 15 detik", color = MaterialTheme.colorScheme.error) }
+                    } else null,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("splash_duration_input")
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (parsedSeconds != null) {
+                        onSaveSeconds(parsedSeconds.coerceIn(1, 15))
+                    }
+                },
+                enabled = isValid,
+                modifier = Modifier.testTag("save_splash_duration_button")
+            ) {
+                Text("Simpan Durasi")
             }
         },
         dismissButton = {

@@ -125,6 +125,7 @@ function doGet(e) {
       driveAuthorized: driveStatus.ok,
       supportsRolling12: true,
       supportsRekapBulananSheet: true,
+      supportsAspirasiMeta: true,
       spreadsheetId: ss.getId(),
       spreadsheetName: ss.getName(),
       kas: kasRows,
@@ -205,6 +206,7 @@ function handleAction(ss, params) {
       driveError: driveStatus.error,
       supportsDriveUpload: driveStatus.ok,
       supportsImageFormula: true,
+      supportsAspirasiMeta: true,
       spreadsheetId: ss.getId(),
       spreadsheetName: ss.getName(),
       message: driveStatus.ok
@@ -310,8 +312,26 @@ function handleAction(ss, params) {
     deleteRow(sheet, params.targetId || data.id);
     SpreadsheetApp.flush();
   } else if (action === "respond_aspirasi") {
-    respondAspirasi(sheet, data, params.targetId);
+    var respResult = respondAspirasi(sheet, data, params.targetId);
+    if (!respResult || !respResult.ok) {
+      return ContentService.createTextOutput(JSON.stringify({
+        status: "error",
+        action: action,
+        sheet: sheetName,
+        message: (respResult && respResult.error) ? respResult.error : "Data aspirasi tidak ditemukan di Spreadsheet."
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
     SpreadsheetApp.flush();
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "success",
+      action: action,
+      sheet: sheetName,
+      aspirasiMetaSaved: true,
+      mode: respResult.mode,
+      rowNum: respResult.rowNum,
+      message: "Tanggapan pengurus berhasil dicatat ke spreadsheet tab " + sheetName,
+      timestamp: new Date().toISOString()
+    })).setMimeType(ContentService.MimeType.JSON);
   }
 
   return ContentService.createTextOutput(JSON.stringify({
@@ -342,7 +362,7 @@ var GALERI_HEADERS = [
 var ASPIRASI_HEADERS = [
   "ID", "Tanggal", "Nama", "Kategori", "Pesan",
   "Foto_Masalah_1", "Foto_Masalah_2", "Foto_Masalah_3", "Foto_Masalah_4", "Foto_Masalah_5",
-  "Status", "Tanggapan pengurus",
+  "Status", "Nama_Pengurus", "Tanggapan_pengurus",
   "Foto_pengerjaan_1", "Foto_pengerjaan_2", "Foto_pengerjaan_3", "Foto_pengerjaan_4", "Foto_pengerjaan_5"
 ];
 
@@ -366,7 +386,7 @@ function ensureSheet(ss, name) {
       sheet.setColumnWidths(6, 10, 150);
     } else if (name === "Aspirasi") {
       sheet.setColumnWidths(6, 5, 150);
-      sheet.setColumnWidths(13, 5, 150);
+      sheet.setColumnWidths(14, 5, 150);
     }
   } else if (name === "Galeri") {
     migrateGaleriSheetLayout(sheet);
@@ -458,16 +478,68 @@ function migrateGaleriSheetLayout(sheet) {
   }
 }
 
+function extractAspirasiMetaName(raw) {
+  if (!raw) return "";
+  var m = raw.toString().match(/\[\[META_BALASAN:([^\]]+)\]\]/);
+  if (!m || !m[1]) return "";
+  var parts = m[1].split("&");
+  for (var i = 0; i < parts.length; i++) {
+    var eq = parts[i].indexOf("=");
+    if (eq > 0 && parts[i].substring(0, eq) === "n") {
+      try {
+        return decodeURIComponent(parts[i].substring(eq + 1).replace(/\+/g, " "));
+      } catch (e) {
+        return parts[i].substring(eq + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function normalizeAspirasiPhotoSlots(s1, s2, s3, s4, s5) {
+  var rawSlots = [s1 || "", s2 || "", s3 || "", s4 || "", s5 || ""];
+  var out = [];
+  for (var i = 0; i < rawSlots.length; i++) {
+    var cell = rawSlots[i] ? rawSlots[i].toString().trim() : "";
+    if (!cell) continue;
+    if (cell.toUpperCase().indexOf("=IMAGE(") === 0) {
+      if (out.indexOf(cell) === -1) out.push(cell);
+    } else if (cell.indexOf(",") !== -1 && (cell.indexOf("http://") !== -1 || cell.indexOf("https://") !== -1)) {
+      var parts = cell.split(",");
+      for (var p = 0; p < parts.length; p++) {
+        var formula = toImageFormula(parts[p]);
+        if (formula && out.indexOf(formula) === -1) out.push(formula);
+      }
+    } else {
+      var singleFormula = toImageFormula(cell);
+      if (singleFormula && out.indexOf(singleFormula) === -1) out.push(singleFormula);
+    }
+    if (out.length >= 5) break;
+  }
+  while (out.length < 5) out.push("");
+  return out.slice(0, 5);
+}
+
+function isImageOrUrlValue(val) {
+  if (!val) return false;
+  var s = val.toString().trim();
+  return s.toUpperCase().indexOf("=IMAGE(") === 0 || s.indexOf("http://") === 0 || s.indexOf("https://") === 0;
+}
+
 function migrateAspirasiSheetLayout(sheet) {
   if (!sheet || sheet.getLastRow() === 0) return;
   var lastCol = sheet.getLastColumn();
   var headerRow = sheet.getRange(1, 1, 1, Math.max(lastCol, 1)).getValues()[0];
-  var isAlreadySynced = lastCol >= 17 &&
-    headerRow[5] === "Foto_Masalah_1" &&
-    headerRow[10] === "Status" &&
-    headerRow[11] === "Tanggapan pengurus" &&
-    headerRow[12] === "Foto_pengerjaan_1" &&
-    headerRow[16] === "Foto_pengerjaan_5";
+  var isAlreadySynced = lastCol === 18;
+  if (isAlreadySynced) {
+    for (var h = 0; h < 18; h++) {
+      var cellHeader = headerRow[h] ? headerRow[h].toString().trim() : "";
+      if (cellHeader !== ASPIRASI_HEADERS[h]) {
+        isAlreadySynced = false;
+        break;
+      }
+    }
+  }
   if (isAlreadySynced) return;
 
   var range = sheet.getDataRange();
@@ -480,47 +552,106 @@ function migrateAspirasiSheetLayout(sheet) {
     var row = values[i];
     var formulaRow = (formulas && formulas[i]) ? formulas[i] : null;
     var obj = {};
-    for (var j = 0; j < oldHeaders.length; j++) {
-      var rawKey = oldHeaders[j] ? oldHeaders[j].toString().trim() : "";
-      if (!rawKey) continue;
+    for (var j = 0; j < Math.max(oldHeaders.length, row.length); j++) {
+      var rawKey = (j < oldHeaders.length && oldHeaders[j]) ? oldHeaders[j].toString().trim() : "";
       var fVal = (formulaRow && formulaRow[j]) ? formulaRow[j].toString() : "";
       var rVal = (row[j] !== undefined && row[j] !== null) ? row[j] : "";
-      obj[rawKey.toLowerCase()] = (fVal.indexOf("=") === 0) ? fVal : rVal;
+      var cellVal = (fVal.indexOf("=") === 0) ? fVal : rVal;
+      if (!rawKey) {
+        // Selamatkan kolom yang sempat bergeser/tanpa header pada row lama sesuai urutan A-R
+        if (j < ASPIRASI_HEADERS.length && cellVal !== "") {
+          var stdKey = ASPIRASI_HEADERS[j].toLowerCase();
+          if (obj[stdKey] === undefined || obj[stdKey] === "") {
+            obj[stdKey] = cellVal;
+          }
+        }
+        continue;
+      }
+      obj[rawKey.toLowerCase()] = cellVal;
     }
 
     var fm1 = obj["foto_masalah_1"] || obj["foto_masalah"] || obj["fotomasalah1"] || obj["fotomasalah"] || "";
+    var masalahSlots = normalizeAspirasiPhotoSlots(
+      fm1,
+      obj["foto_masalah_2"] || obj["fotomasalah2"] || "",
+      obj["foto_masalah_3"] || obj["fotomasalah3"] || "",
+      obj["foto_masalah_4"] || obj["fotomasalah4"] || "",
+      obj["foto_masalah_5"] || obj["fotomasalah5"] || ""
+    );
+
     var fp1 = obj["foto_pengerjaan_1"] || obj["foto_pengerjaan"] || obj["fotopengerjaan1"] || obj["fotopengerjaan"] || "";
+    var pengerjaanSlots = normalizeAspirasiPhotoSlots(
+      fp1,
+      obj["foto_pengerjaan_2"] || obj["fotopengerjaan2"] || "",
+      obj["foto_pengerjaan_3"] || obj["fotopengerjaan3"] || "",
+      obj["foto_pengerjaan_4"] || obj["fotopengerjaan4"] || "",
+      obj["foto_pengerjaan_5"] || obj["fotopengerjaan5"] || ""
+    );
+
+    var rawTanggapan = obj["tanggapan_pengurus"] || obj["tanggapan pengurus"] || obj["tanggapanpengurus"] || obj["tanggapan"] || "";
+    var namaPengurus = obj["nama_pengurus"] || obj["nama pengurus"] || obj["namapengurus"] ||
+      obj["penanggap_nama"] || obj["penanggap nama"] || obj["penanggapnama"] ||
+      extractAspirasiMetaName(rawTanggapan) || "";
+
+    var rawStatus = obj["status"] ? obj["status"].toString().trim() : "";
+    if (!rawStatus || isImageOrUrlValue(rawStatus)) {
+      if (namaPengurus && /^(menunggu|diproses|selesai)$/i.test(namaPengurus.toString().trim())) {
+        rawStatus = namaPengurus.toString().trim();
+        namaPengurus = "";
+      } else {
+        rawStatus = stripAspirasiMetaMarker(rawTanggapan) ? "Diproses" : "Menunggu";
+      }
+    }
+
     migratedRows.push([
       obj["id"] || "",
       obj["tanggal"] || "",
       obj["nama"] || "",
       obj["kategori"] || "Masukan/Saran",
       obj["pesan"] || "",
-      toImageFormula(fm1),
-      toImageFormula(obj["foto_masalah_2"] || obj["fotomasalah2"] || ""),
-      toImageFormula(obj["foto_masalah_3"] || obj["fotomasalah3"] || ""),
-      toImageFormula(obj["foto_masalah_4"] || obj["fotomasalah4"] || ""),
-      toImageFormula(obj["foto_masalah_5"] || obj["fotomasalah5"] || ""),
-      obj["status"] || "Menunggu",
-      obj["tanggapan pengurus"] || obj["tanggapan_pengurus"] || obj["tanggapanpengurus"] || "",
-      toImageFormula(fp1),
-      toImageFormula(obj["foto_pengerjaan_2"] || obj["fotopengerjaan2"] || ""),
-      toImageFormula(obj["foto_pengerjaan_3"] || obj["fotopengerjaan3"] || ""),
-      toImageFormula(obj["foto_pengerjaan_4"] || obj["fotopengerjaan4"] || ""),
-      toImageFormula(obj["foto_pengerjaan_5"] || obj["fotopengerjaan5"] || "")
+      masalahSlots[0],
+      masalahSlots[1],
+      masalahSlots[2],
+      masalahSlots[3],
+      masalahSlots[4],
+      rawStatus,
+      namaPengurus,
+      stripAspirasiMetaMarker(rawTanggapan),
+      pengerjaanSlots[0],
+      pengerjaanSlots[1],
+      pengerjaanSlots[2],
+      pengerjaanSlots[3],
+      pengerjaanSlots[4]
     ]);
   }
 
-  var clearCols = Math.max(oldHeaders.length, 17);
+  var clearCols = Math.max(oldHeaders.length, 18);
   if (values.length > 1) {
     sheet.getRange(2, 1, values.length - 1, clearCols).clearContent();
   }
-  sheet.getRange(1, 1, 1, 17).setValues([ASPIRASI_HEADERS]).setFontWeight("bold").setBackground("#D9E1F2");
+  if (oldHeaders.length > 18) {
+    sheet.getRange(1, 19, 1, oldHeaders.length - 18).clearContent();
+  }
+  sheet.getRange(1, 1, 1, 18).setValues([ASPIRASI_HEADERS]).setFontWeight("bold").setBackground("#D9E1F2");
   if (migratedRows.length > 0) {
-    sheet.getRange(2, 1, migratedRows.length, 17).setValues(migratedRows);
+    sheet.getRange(2, 1, migratedRows.length, 18).setValues(migratedRows);
   }
   sheet.setColumnWidths(6, 5, 150);
-  sheet.setColumnWidths(13, 5, 150);
+  sheet.setColumnWidths(14, 5, 150);
+  for (var r = 0; r < migratedRows.length; r++) {
+    var rowHasPhoto = false;
+    for (var mc = 5; mc <= 9; mc++) {
+      if (migratedRows[r][mc]) { rowHasPhoto = true; break; }
+    }
+    if (!rowHasPhoto) {
+      for (var pc = 13; pc <= 17; pc++) {
+        if (migratedRows[r][pc]) { rowHasPhoto = true; break; }
+      }
+    }
+    if (rowHasPhoto) {
+      sheet.setRowHeight(r + 2, 100);
+    }
+  }
 }
 
 function getSheetData(sheet) {
@@ -626,26 +757,46 @@ function convertObjToRow(sheetName, d) {
       d.petugas || ""
     ];
   } else if (sheetName === "Aspirasi") {
-    var fm1 = d.fotoMasalah1 || d.fotoMasalah || "";
-    var fp1 = d.fotoPengerjaan1 || d.fotoPengerjaan || "";
+    var fm1 = d.fotoMasalah1 || d.Foto_Masalah_1 || d.fotoMasalah || d.Foto_Masalah || "";
+    var masalahSlots = normalizeAspirasiPhotoSlots(
+      fm1,
+      d.fotoMasalah2 || d.Foto_Masalah_2 || "",
+      d.fotoMasalah3 || d.Foto_Masalah_3 || "",
+      d.fotoMasalah4 || d.Foto_Masalah_4 || "",
+      d.fotoMasalah5 || d.Foto_Masalah_5 || ""
+    );
+    var fp1 = d.fotoPengerjaan1 || d.Foto_pengerjaan_1 || d.Foto_Pengerjaan_1 || d.fotoPengerjaan || d.Foto_pengerjaan || d.Foto_Pengerjaan || "";
+    var pengerjaanSlots = normalizeAspirasiPhotoSlots(
+      fp1,
+      d.fotoPengerjaan2 || d.Foto_pengerjaan_2 || d.Foto_Pengerjaan_2 || "",
+      d.fotoPengerjaan3 || d.Foto_pengerjaan_3 || d.Foto_Pengerjaan_3 || "",
+      d.fotoPengerjaan4 || d.Foto_pengerjaan_4 || d.Foto_Pengerjaan_4 || "",
+      d.fotoPengerjaan5 || d.Foto_pengerjaan_5 || d.Foto_Pengerjaan_5 || ""
+    );
+    var namaPengurusVal = (d.namaPengurus || d.Nama_Pengurus || d.penanggapNama || "").toString().trim();
+    var cleanTanggapan = stripAspirasiMetaMarker(
+      d.tanggapanPengurus || d.Tanggapan_pengurus || d.Tanggapan_Pengurus || d.tanggapan_pengurus || ""
+    );
+    var statusVal = (d.status || d.Status || "Menunggu").toString().trim() || "Menunggu";
     return [
-      d.id || "ASP-" + now.getTime(),
-      d.tanggal || dateStr,
-      d.nama || "",
-      d.kategori || "Masukan/Saran",
-      d.pesan || "",
-      toImageFormula(fm1),
-      toImageFormula(d.fotoMasalah2 || ""),
-      toImageFormula(d.fotoMasalah3 || ""),
-      toImageFormula(d.fotoMasalah4 || ""),
-      toImageFormula(d.fotoMasalah5 || ""),
-      d.status || "Menunggu",
-      d.tanggapanPengurus || "",
-      toImageFormula(fp1),
-      toImageFormula(d.fotoPengerjaan2 || ""),
-      toImageFormula(d.fotoPengerjaan3 || ""),
-      toImageFormula(d.fotoPengerjaan4 || ""),
-      toImageFormula(d.fotoPengerjaan5 || "")
+      d.id || d.ID || ("ASP-" + now.getTime()),
+      d.tanggal || d.Tanggal || dateStr,
+      d.nama || d.Nama || "",
+      d.kategori || d.Kategori || "Masukan/Saran",
+      d.pesan || d.Pesan || "",
+      masalahSlots[0],
+      masalahSlots[1],
+      masalahSlots[2],
+      masalahSlots[3],
+      masalahSlots[4],
+      statusVal,
+      namaPengurusVal,
+      cleanTanggapan,
+      pengerjaanSlots[0],
+      pengerjaanSlots[1],
+      pengerjaanSlots[2],
+      pengerjaanSlots[3],
+      pengerjaanSlots[4]
     ];
   }
   return [];
@@ -678,9 +829,9 @@ function formatPhotoRow(sheet, sheetName, rowIndex) {
       sheet.setRowHeight(rowIndex, 100);
     }
   } else if (sheetName === "Aspirasi") {
-    if (sheet.getLastColumn() >= 17) {
+    if (sheet.getLastColumn() >= 18) {
       sheet.setColumnWidths(6, 5, 150);
-      sheet.setColumnWidths(13, 5, 150);
+      sheet.setColumnWidths(14, 5, 150);
     }
     var hasPhoto = false;
     for (var col = 6; col <= 10; col++) {
@@ -689,8 +840,8 @@ function formatPhotoRow(sheet, sheetName, rowIndex) {
         break;
       }
     }
-    if (!hasPhoto && sheet.getLastColumn() >= 17) {
-      for (var colP = 13; colP <= 17; colP++) {
+    if (!hasPhoto && sheet.getLastColumn() >= 18) {
+      for (var colP = 14; colP <= 18; colP++) {
         if (sheet.getRange(rowIndex, colP).getValue() || sheet.getRange(rowIndex, colP).getFormula()) {
           hasPhoto = true;
           break;
@@ -704,10 +855,10 @@ function formatPhotoRow(sheet, sheetName, rowIndex) {
 }
 
 function updateRow(sheet, sheetName, data, targetId) {
-  var id = targetId || data.id;
+  var id = (targetId || data.id || data.ID || "").toString().trim();
   var values = sheet.getDataRange().getValues();
   for (var i = 1; i < values.length; i++) {
-    if (values[i][0].toString() === id.toString()) {
+    if (values[i][0].toString().trim() === id) {
       var row = (sheetName === "Kas_RT") ? convertKasObjToRow(sheet, data) : convertObjToRow(sheetName, data);
       sheet.getRange(i + 1, 1, 1, row.length).setValues([row]);
       formatPhotoRow(sheet, sheetName, i + 1);
@@ -903,35 +1054,88 @@ function readRekapBulananSheet(ss) {
 }
 
 function deleteRow(sheet, id) {
+  var target = (id || "").toString().trim();
   var values = sheet.getDataRange().getValues();
   for (var i = 1; i < values.length; i++) {
-    if (values[i][0].toString() === id.toString()) {
+    if (values[i][0].toString().trim() === target) {
       sheet.deleteRow(i + 1);
       return;
     }
   }
 }
 
+function stripAspirasiMetaMarker(raw) {
+  if (!raw) return "";
+  return raw.toString().replace(/\s*\[\[META_BALASAN:[^\]]+\]\]\s*/g, "\n").trim();
+}
+
 function respondAspirasi(sheet, data, targetId) {
-  var id = targetId || data.id;
+  migrateAspirasiSheetLayout(sheet);
+  var id = (targetId || data.id || data.ID || "").toString().trim();
+  if (!id) {
+    return { ok: false, error: "ID aspirasi kosong sehingga balasan tidak dapat dicocokkan." };
+  }
+  var cleanTanggapan = stripAspirasiMetaMarker(
+    data.tanggapanPengurus || data.Tanggapan_pengurus || data.Tanggapan_Pengurus || data.tanggapan_pengurus || ""
+  );
+  var namaPengurusVal = (data.namaPengurus || data.Nama_Pengurus || data.penanggapNama || "").toString().trim();
+  var statusRaw = (data.status !== undefined && data.status !== null && data.status !== "") ? data.status : data.Status;
+  var statusVal = (statusRaw !== undefined && statusRaw !== null && statusRaw.toString().trim() !== "") ? statusRaw.toString().trim() : "Menunggu";
+
+  var fp1 = (data.fotoPengerjaan1 !== undefined && data.fotoPengerjaan1 !== "") ? data.fotoPengerjaan1
+    : (data.Foto_pengerjaan_1 || data.Foto_Pengerjaan_1 || data.fotoPengerjaan || data.Foto_pengerjaan || data.Foto_Pengerjaan || "");
+  var pengerjaanSlots = normalizeAspirasiPhotoSlots(
+    fp1,
+    data.fotoPengerjaan2 || data.Foto_pengerjaan_2 || data.Foto_Pengerjaan_2 || "",
+    data.fotoPengerjaan3 || data.Foto_pengerjaan_3 || data.Foto_Pengerjaan_3 || "",
+    data.fotoPengerjaan4 || data.Foto_pengerjaan_4 || data.Foto_Pengerjaan_4 || "",
+    data.fotoPengerjaan5 || data.Foto_pengerjaan_5 || data.Foto_Pengerjaan_5 || ""
+  );
+
   var values = sheet.getDataRange().getValues();
   for (var i = 1; i < values.length; i++) {
-    if (values[i][0].toString() === id.toString()) {
+    if (values[i][0].toString().trim() === id) {
       var rowNum = i + 1;
-      if (data.status !== undefined) sheet.getRange(rowNum, 11).setValue(data.status || "Menunggu");
-      if (data.tanggapanPengurus !== undefined) sheet.getRange(rowNum, 12).setValue(data.tanggapanPengurus || "");
-      var fp1 = data.fotoPengerjaan1 !== undefined ? data.fotoPengerjaan1 : (data.fotoPengerjaan || "");
-      sheet.getRange(rowNum, 13, 1, 5).setValues([[
-        toImageFormula(fp1),
-        toImageFormula(data.fotoPengerjaan2 || ""),
-        toImageFormula(data.fotoPengerjaan3 || ""),
-        toImageFormula(data.fotoPengerjaan4 || ""),
-        toImageFormula(data.fotoPengerjaan5 || "")
+      // Perbarui tepat Kolom K (Status), Kolom L (Nama_Pengurus), Kolom M (Tanggapan_pengurus),
+      // dan Kolom N-R (Foto_pengerjaan_1..5) tanpa menyentuh Kolom A-J atau menduplikasi baris.
+      sheet.getRange(rowNum, 11, 1, 8).setValues([[
+        statusVal,
+        namaPengurusVal,
+        cleanTanggapan,
+        pengerjaanSlots[0],
+        pengerjaanSlots[1],
+        pengerjaanSlots[2],
+        pengerjaanSlots[3],
+        pengerjaanSlots[4]
       ]]);
       formatPhotoRow(sheet, "Aspirasi", rowNum);
-      return;
+      return { ok: true, mode: "updated", rowNum: rowNum };
     }
   }
+
+  // Upsert baris jika aspirasi belum tercatat di sheet (mis. item baru/offline/seed)
+  if (data.pesan || data.Pesan || data.nama || data.Nama || cleanTanggapan) {
+    var upsertData = {};
+    for (var k in data) {
+      if (Object.prototype.hasOwnProperty.call(data, k)) upsertData[k] = data[k];
+    }
+    upsertData.id = id;
+    upsertData.status = statusVal;
+    upsertData.namaPengurus = namaPengurusVal;
+    upsertData.tanggapanPengurus = cleanTanggapan;
+    upsertData.fotoPengerjaan1 = pengerjaanSlots[0];
+    upsertData.fotoPengerjaan2 = pengerjaanSlots[1];
+    upsertData.fotoPengerjaan3 = pengerjaanSlots[2];
+    upsertData.fotoPengerjaan4 = pengerjaanSlots[3];
+    upsertData.fotoPengerjaan5 = pengerjaanSlots[4];
+    var newRow = convertObjToRow("Aspirasi", upsertData);
+    sheet.appendRow(newRow);
+    var appendedRow = sheet.getLastRow();
+    formatPhotoRow(sheet, "Aspirasi", appendedRow);
+    return { ok: true, mode: "inserted", rowNum: appendedRow };
+  }
+
+  return { ok: false, error: "Baris aspirasi dengan ID '" + id + "' tidak ditemukan di Spreadsheet." };
 }
 
 function backupAllData(ss, allData) {

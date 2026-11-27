@@ -12,7 +12,7 @@ import java.text.NumberFormat
 import java.util.Locale
 
 class WargaViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = WargaRepository(application)
+    internal val repository = WargaRepository(application)
 
     val kasList: StateFlow<List<KasItem>> = repository.kasList
     val kasRolling12: StateFlow<List<KasMonthlyRecap>> = repository.rolling12List
@@ -23,6 +23,10 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     val galeriList: StateFlow<List<GaleriItem>> = repository.galeriList
     val aspirasiList: StateFlow<List<AspirasiItem>> = repository.aspirasiList
     val userRole: StateFlow<UserRole> = repository.userRole
+    val currentPengurusAccount: StateFlow<PengurusAccount?> = repository.currentPengurusAccount
+    val activeRoleDisplayName: StateFlow<String> = repository.activeRoleDisplayName
+    val pengurusAccounts: StateFlow<List<PengurusAccount>> = repository.pengurusAccounts
+    val splashDurationMs: StateFlow<Long> = repository.splashDurationMs
     val isSyncing: StateFlow<Boolean> = repository.isSyncing
     val syncMessage: StateFlow<String?> = repository.syncMessage
     val needsScriptUpdate: StateFlow<Boolean> = repository.needsScriptUpdate
@@ -50,6 +54,15 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _changePasswordError = MutableStateFlow<String?>(null)
     val changePasswordError: StateFlow<String?> = _changePasswordError.asStateFlow()
+
+    private val _showPengurusAccountsDialog = MutableStateFlow(false)
+    val showPengurusAccountsDialog: StateFlow<Boolean> = _showPengurusAccountsDialog.asStateFlow()
+
+    private val _showSplashSettingsDialog = MutableStateFlow(false)
+    val showSplashSettingsDialog: StateFlow<Boolean> = _showSplashSettingsDialog.asStateFlow()
+
+    private val _showNotificationToneDialog = MutableStateFlow(false)
+    val showNotificationToneDialog: StateFlow<Boolean> = _showNotificationToneDialog.asStateFlow()
 
     // Entity Creation/Edit Dialogs
     private val _showAddKasDialog = MutableStateFlow(false)
@@ -118,15 +131,12 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
         )
 
     init {
-        // Initial sync and periodic polling for real-time updates
+        // Periodic polling for real-time updates (initial sync starts automatically in WargaRepository.init)
         viewModelScope.launch {
-            if (repository.sheetUrl.value.isNotBlank()) {
-                repository.syncWithSheet()
-            }
             while (true) {
                 delay(20000) // Poll every 20s automatically without user setup
                 if (repository.sheetUrl.value.isNotBlank()) {
-                    repository.syncWithSheet()
+                    repository.refreshIfStaleOrUnverified(minIntervalMs = 15000L)
                 }
             }
         }
@@ -142,19 +152,35 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectTab(tabIndex: Int) {
         _currentTab.value = tabIndex
+        if (repository.sheetUrl.value.isNotBlank()) {
+            viewModelScope.launch {
+                if (tabIndex == 4) {
+                    repository.syncWithSheet(force = true)
+                } else {
+                    repository.refreshIfStaleOrUnverified(minIntervalMs = 4000L)
+                }
+            }
+        }
     }
 
     fun syncOnResume() {
         if (repository.isSyncing.value || repository.sheetUrl.value.isBlank()) return
         viewModelScope.launch {
-            repository.syncWithSheet()
+            if (_currentTab.value == 4) {
+                repository.syncWithSheet(force = true)
+            } else {
+                repository.refreshIfStaleOrUnverified(minIntervalMs = 4000L)
+            }
         }
     }
 
     fun triggerRefresh() {
         viewModelScope.launch {
-            repository.syncManager.flushPendingSync()
-            val result = repository.syncWithSheet()
+            repository.syncManager.ensureRealtimeSyncConnected()
+            try {
+                repository.syncManager.flushPendingSync()
+            } catch (_: Exception) {}
+            val result = repository.syncWithSheet(force = true)
             if (result.isSuccess) {
                 _snackbarMessage.value = "Data terbaru berhasil disinkronkan!"
             } else {
@@ -165,7 +191,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveSheetUrl(url: String) {
         if (userRole.value == UserRole.WARGA) return
-        repository.setSheetUrl(url)
+        repository.updateSheetUrlOnly(url)
         _showConfigDialog.value = false
         triggerRefresh()
     }
@@ -182,6 +208,29 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun dismissNotificationDialog() {
         _showNotificationDialog.value = false
+    }
+
+    fun openNotificationToneDialog() {
+        _showNotificationToneDialog.value = true
+    }
+
+    fun dismissNotificationToneDialog() {
+        _showNotificationToneDialog.value = false
+    }
+
+    fun saveNotificationTone(
+        option: com.example.util.NotificationToneOption,
+        customUri: String,
+        customTitle: String
+    ) {
+        val saved = com.example.util.NotificationToneManager.savePreference(
+            context = getApplication(),
+            option = option,
+            customUri = customUri,
+            customTitle = customTitle
+        )
+        _showNotificationToneDialog.value = false
+        _snackbarMessage.value = "Nada notifikasi HP ini disimpan: ${saved.displayLabel()}"
     }
 
     fun testSpreadsheetConnection(urlToTest: String? = null, onResult: (Boolean, String) -> Unit) {
@@ -223,28 +272,112 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun verifyPassword(password: String) {
-        val success = repository.verifyAuthority(password)
-        if (success) {
-            _showAuthorityDialog.value = false
-            _authorityError.value = null
-            _snackbarMessage.value = "Akses Pengurus RT Berhasil Terbuka"
-            _authorityTargetAction.value?.invoke()
-            _authorityTargetAction.value = null
-        } else {
-            _authorityError.value = "Maaf ya brooo"
+    fun requireAdmin(onSuccess: () -> Unit) {
+        when (userRole.value) {
+            UserRole.ADMIN_UTAMA -> onSuccess()
+            UserRole.PENGURUS -> {
+                _snackbarMessage.value = "Fitur ini khusus Admin"
+            }
+            UserRole.WARGA -> {
+                _authorityTargetAction.value = {
+                    if (userRole.value == UserRole.ADMIN_UTAMA) {
+                        onSuccess()
+                    } else {
+                        _snackbarMessage.value = "Fitur ini khusus Admin"
+                    }
+                }
+                _authorityError.value = null
+                _showAuthorityDialog.value = true
+            }
+        }
+    }
+
+    fun verifyPassword(username: String, password: String) {
+        when (val result = repository.verifyAuthority(username, password)) {
+            is WargaRepository.AuthorityLoginResult.Success -> {
+                _showAuthorityDialog.value = false
+                _authorityError.value = null
+                _snackbarMessage.value = if (result.role == UserRole.ADMIN_UTAMA) {
+                    "Akses Admin (${repository.activeRoleDisplayName.value}) Berhasil Terbuka"
+                } else {
+                    val nama = result.pengurusAccount?.namaAsli?.takeIf { it.isNotBlank() }
+                    if (nama != null) "Akses Pengurus ($nama) Terbuka" else "Akses Pengurus RT Berhasil Terbuka"
+                }
+                _authorityTargetAction.value?.invoke()
+                _authorityTargetAction.value = null
+                viewModelScope.launch {
+                    repository.refreshOnModeSwitch()
+                }
+            }
+            is WargaRepository.AuthorityLoginResult.Failure -> {
+                _authorityError.value = result.message
+            }
         }
     }
 
     fun lockToWargaMode() {
-        repository.setRole(UserRole.WARGA)
+        repository.lockToWargaMode()
         _snackbarMessage.value = "Beralih ke Mode Warga (Hanya Baca)"
+        viewModelScope.launch {
+            repository.refreshOnModeSwitch()
+        }
     }
 
     fun openChangePasswordDialog() {
-        requireAuthority {
+        requireAdmin {
             _changePasswordError.value = null
             _showChangePasswordDialog.value = true
+        }
+    }
+
+    fun openPengurusAccountsDialog() {
+        requireAdmin {
+            _showPengurusAccountsDialog.value = true
+        }
+    }
+
+    fun dismissPengurusAccountsDialog() {
+        _showPengurusAccountsDialog.value = false
+    }
+
+    fun savePengurusAccount(account: PengurusAccount): Pair<Boolean, String> {
+        if (userRole.value != UserRole.ADMIN_UTAMA) {
+            return Pair(false, "Hanya Admin Induk yang dapat mengelola akun pengurus.")
+        }
+        val res = repository.savePengurusAccount(account)
+        _snackbarMessage.value = res.second
+        return res
+    }
+
+    fun togglePengurusAccountActive(accountId: String, aktif: Boolean) {
+        requireAdmin {
+            val res = repository.togglePengurusAccountActive(accountId, aktif)
+            _snackbarMessage.value = res.second
+        }
+    }
+
+    fun deletePengurusAccount(accountId: String) {
+        requireAdmin {
+            val res = repository.deletePengurusAccount(accountId)
+            _snackbarMessage.value = res.second
+        }
+    }
+
+    fun openSplashSettingsDialog() {
+        requireAdmin {
+            _showSplashSettingsDialog.value = true
+        }
+    }
+
+    fun dismissSplashSettingsDialog() {
+        _showSplashSettingsDialog.value = false
+    }
+
+    fun updateSplashDurationSeconds(seconds: Int) {
+        requireAdmin {
+            val (_, msg) = repository.updateSplashDurationMs(seconds.toLong() * 1000L)
+            _showSplashSettingsDialog.value = false
+            _snackbarMessage.value = msg
         }
     }
 
@@ -304,6 +437,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveKasTransaction(item: KasItem) {
+        if (userRole.value == UserRole.WARGA) return
         viewModelScope.launch {
             if (com.example.util.PhotoStorageHelper.isLocalUri(item.buktiFoto)) {
                 _snackbarMessage.value = "Mengunggah bukti foto ke Cloud..."
@@ -315,7 +449,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteKasTransaction(id: String) {
-        requireAuthority {
+        requireAdmin {
             viewModelScope.launch {
                 repository.deleteKas(id)
                 _snackbarMessage.value = "Transaksi Kas Berhasil Dihapus"
@@ -323,9 +457,9 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Pengurus CRUD ---
+    // --- Pengurus CRUD (Khusus Admin) ---
     fun openPengurusDialog(item: PengurusItem? = null) {
-        requireAuthority {
+        requireAdmin {
             _editingPengurusItem.value = item
             _showAddPengurusDialog.value = true
         }
@@ -337,7 +471,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun savePengurus(item: PengurusItem, isEdit: Boolean) {
-        requireAuthority {
+        requireAdmin {
             viewModelScope.launch {
                 if (com.example.util.PhotoStorageHelper.isLocalUri(item.foto)) {
                     _snackbarMessage.value = "Mengunggah foto pengurus ke Cloud..."
@@ -350,7 +484,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deletePengurus(id: String) {
-        requireAuthority {
+        requireAdmin {
             viewModelScope.launch {
                 repository.deletePengurus(id)
                 _snackbarMessage.value = "Data Pengurus RT Berhasil Dihapus"
@@ -385,7 +519,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteUndangan(id: String) {
-        requireAuthority {
+        requireAdmin {
             viewModelScope.launch {
                 repository.deleteUndangan(id)
                 _snackbarMessage.value = "Undangan Berhasil Dihapus"
@@ -442,6 +576,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveGaleri(item: GaleriItem) {
+        if (userRole.value == UserRole.WARGA) return
         viewModelScope.launch {
             if (item.foto.split(",").any { com.example.util.PhotoStorageHelper.isLocalUri(it) }) {
                 _snackbarMessage.value = "Mengunggah foto galeri ke Cloud & Spreadsheet..."
@@ -453,7 +588,7 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteGaleri(id: String) {
-        requireAuthority {
+        requireAdmin {
             viewModelScope.launch {
                 repository.deleteGaleri(id)
                 _snackbarMessage.value = "Foto Galeri Berhasil Dihapus"
@@ -494,19 +629,26 @@ class WargaViewModel(application: Application) : AndroidViewModel(application) {
         _selectedAspirasiForResponse.value = null
     }
 
-    fun saveTanggapanAspirasi(id: String, status: String, tanggapan: String, fotoPengerjaan: String) {
+    fun saveTanggapanAspirasi(
+        id: String,
+        status: String,
+        tanggapan: String,
+        fotoPengerjaan: String,
+        namaPenanggap: String
+    ) {
+        if (userRole.value == UserRole.WARGA) return
         viewModelScope.launch {
             if (fotoPengerjaan.split(",").any { com.example.util.PhotoStorageHelper.isLocalUri(it) }) {
                 _snackbarMessage.value = "Mengunggah foto bukti pengerjaan ke Cloud..."
             }
             dismissRespondAspirasiDialog()
-            val result = repository.respondAspirasi(id, status, tanggapan, fotoPengerjaan)
+            val result = repository.respondAspirasi(id, status, tanggapan, fotoPengerjaan, namaPenanggap)
             handleCloudSaveResult(result)
         }
     }
 
     fun deleteAspirasi(id: String) {
-        requireAuthority {
+        requireAdmin {
             viewModelScope.launch {
                 repository.deleteAspirasi(id)
                 _snackbarMessage.value = "Aspirasi Berhasil Dihapus"

@@ -2,6 +2,8 @@ package com.example.data.source
 
 import android.util.Log
 import com.example.data.model.*
+import com.example.util.ScriptCapabilities
+import com.example.util.ScriptSyncDiagnostics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -14,6 +16,13 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+
+data class ConnectionCheckResult(
+    val ok: Boolean,
+    val message: String,
+    val capabilities: ScriptCapabilities? = null,
+    val reachable: Boolean = false
+)
 
 class GoogleSheetsService {
     private val client = OkHttpClient.Builder()
@@ -40,15 +49,29 @@ class GoogleSheetsService {
     private var multiPhotoCheckedUrl: String? = null
 
     @Volatile
+    private var aspirasiMetaSupportedUrl: String? = null
+
+    @Volatile
     var lastDriveUploadError: String? = null
         private set
+
+    @Volatile
+    var lastActionError: String? = null
+        private set
+
+    fun isAspirasiMetaSupported(url: String): Boolean {
+        val cleanUrl = url.trim()
+        return cleanUrl.isNotBlank() && aspirasiMetaSupportedUrl == cleanUrl
+    }
 
     fun resetCapabilityCache() {
         unsupportedDriveScriptUrl = null
         multiPhotoSupportedUrl = null
         galeri10ColsSupportedUrl = null
         multiPhotoCheckedUrl = null
+        aspirasiMetaSupportedUrl = null
         lastDriveUploadError = null
+        lastActionError = null
     }
 
     suspend fun supportsMultiPhotoColumns(url: String): Boolean = withContext(Dispatchers.IO) {
@@ -90,7 +113,7 @@ class GoogleSheetsService {
             rawBody to parseSheetResponse(rawBody, cleanUrl)
         }
 
-        if (parsed.hasUnreadableImageFormula) {
+        val hydrated = if (parsed.hasUnreadableImageFormula) {
             val spreadsheetId = try {
                 JSONObject(body).optString("spreadsheetId", "").trim()
             } catch (_: Exception) {
@@ -100,6 +123,38 @@ class GoogleSheetsService {
         } else {
             parsed
         }
+
+        // Cross-verify capabilities via ?action=test_connection only if doGet omitted version/Drive metadata
+        // or returned an older/incomplete script signature so we never show false v1/v2 warnings.
+        if (!hydrated.hasExplicitVersion || hydrated.scriptVersion < 8 || !hydrated.hasExplicitDriveAuth || !hydrated.driveAuthorized) {
+            val check = try {
+                testConnectionDetailed(cleanUrl)
+            } catch (_: Exception) {
+                null
+            }
+            val verifiedCaps = check?.capabilities
+            if (check != null && check.reachable && verifiedCaps != null) {
+                val mergedVersion = maxOf(hydrated.scriptVersion, verifiedCaps.effectiveVersion)
+                val mergedDrive = if (verifiedCaps.hasExplicitDriveAuth) {
+                    verifiedCaps.driveAuthorized
+                } else {
+                    hydrated.driveAuthorized || verifiedCaps.driveAuthorized
+                }
+                if (mergedVersion >= 8 && mergedDrive) {
+                    unsupportedDriveScriptUrl = null
+                    lastDriveUploadError = null
+                }
+                return@withContext hydrated.copy(
+                    scriptVersion = mergedVersion,
+                    driveAuthorized = mergedDrive,
+                    hasExplicitVersion = hydrated.hasExplicitVersion || verifiedCaps.hasExplicitVersion,
+                    hasExplicitDriveAuth = hydrated.hasExplicitDriveAuth || verifiedCaps.hasExplicitDriveAuth,
+                    supportsDriveUpload = hydrated.supportsDriveUpload || verifiedCaps.supportsDriveUpload,
+                    maxGaleriPhotos = maxOf(hydrated.maxGaleriPhotos, verifiedCaps.maxGaleriPhotos)
+                )
+            }
+        }
+        hydrated
     }
 
     private fun hydrateFromPublicXlsx(
@@ -186,23 +241,23 @@ class GoogleSheetsService {
                     }
                     val existingMasalah = item.fotoMasalah.split(",").map { it.trim() }.filter { it.isNotBlank() }
                     val extractedMasalah = listOfNotNull(
-                        findAspCol("Foto_Masalah_1", "Foto_Masalah", "fotoMasalah1", "fotoMasalah"),
-                        findAspCol("Foto_Masalah_2", "fotoMasalah2"),
-                        findAspCol("Foto_Masalah_3", "fotoMasalah3"),
-                        findAspCol("Foto_Masalah_4", "fotoMasalah4"),
-                        findAspCol("Foto_Masalah_5", "fotoMasalah5")
+                        findAspCol("Foto_Masalah_1", "foto_masalah_1", "fotoMasalah1", "Foto_Masalah", "fotoMasalah"),
+                        findAspCol("Foto_Masalah_2", "foto_masalah_2", "fotoMasalah2"),
+                        findAspCol("Foto_Masalah_3", "foto_masalah_3", "fotoMasalah3"),
+                        findAspCol("Foto_Masalah_4", "foto_masalah_4", "fotoMasalah4"),
+                        findAspCol("Foto_Masalah_5", "foto_masalah_5", "fotoMasalah5")
                     ).flatMap { it.split(",") }.map { it.trim() }.filter { it.isNotBlank() }
-                    val masalah = (existingMasalah + extractedMasalah).distinct().joinToString(",")
+                    val masalah = (existingMasalah + extractedMasalah).distinct().take(5).joinToString(",")
 
                     val existingPengerjaan = item.fotoPengerjaan.split(",").map { it.trim() }.filter { it.isNotBlank() }
                     val extractedPengerjaan = listOfNotNull(
-                        findAspCol("Foto_pengerjaan_1", "Foto_Pengerjaan_1", "Foto_Pengerjaan", "fotoPengerjaan1", "fotoPengerjaan"),
-                        findAspCol("Foto_pengerjaan_2", "Foto_Pengerjaan_2", "fotoPengerjaan2"),
-                        findAspCol("Foto_pengerjaan_3", "Foto_Pengerjaan_3", "fotoPengerjaan3"),
-                        findAspCol("Foto_pengerjaan_4", "Foto_Pengerjaan_4", "fotoPengerjaan4"),
-                        findAspCol("Foto_pengerjaan_5", "Foto_Pengerjaan_5", "fotoPengerjaan5")
+                        findAspCol("Foto_pengerjaan_1", "Foto_Pengerjaan_1", "foto_pengerjaan_1", "fotoPengerjaan1", "Foto_pengerjaan", "Foto_Pengerjaan", "fotoPengerjaan"),
+                        findAspCol("Foto_pengerjaan_2", "Foto_Pengerjaan_2", "foto_pengerjaan_2", "fotoPengerjaan2"),
+                        findAspCol("Foto_pengerjaan_3", "Foto_Pengerjaan_3", "foto_pengerjaan_3", "fotoPengerjaan3"),
+                        findAspCol("Foto_pengerjaan_4", "Foto_Pengerjaan_4", "foto_pengerjaan_4", "fotoPengerjaan4"),
+                        findAspCol("Foto_pengerjaan_5", "Foto_Pengerjaan_5", "foto_pengerjaan_5", "fotoPengerjaan5")
                     ).flatMap { it.split(",") }.map { it.trim() }.filter { it.isNotBlank() }
-                    val pengerjaan = (existingPengerjaan + extractedPengerjaan).distinct().joinToString(",")
+                    val pengerjaan = (existingPengerjaan + extractedPengerjaan).distinct().take(5).joinToString(",")
                     item.copy(fotoMasalah = masalah, fotoPengerjaan = pengerjaan)
                 }
             }
@@ -219,17 +274,25 @@ class GoogleSheetsService {
         }
     }
 
-    suspend fun testConnection(url: String): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+    suspend fun testConnection(url: String): Pair<Boolean, String> {
+        val result = testConnectionDetailed(url)
+        return Pair(result.ok, result.message)
+    }
+
+    suspend fun testConnectionDetailed(url: String): ConnectionCheckResult = withContext(Dispatchers.IO) {
         try {
             val cleanUrl = url.trim()
             if (cleanUrl.contains("docs.google.com/spreadsheets")) {
-                return@withContext Pair(
-                    false,
-                    "Tautan 'docs.google.com' adalah halaman spreadsheet Anda di browser. Anda memerlukan URL Web App (berakhiran /exec dari Apps Script) agar Google mengizinkan aplikasi menulis & membaca data tanpa login akun Google."
+                return@withContext ConnectionCheckResult(
+                    ok = false,
+                    message = "Tautan 'docs.google.com' adalah halaman spreadsheet Anda di browser. Anda memerlukan URL Web App (berakhiran /exec dari Apps Script) agar Google mengizinkan aplikasi menulis & membaca data tanpa login akun Google."
                 )
             }
             if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
-                return@withContext Pair(false, "Format URL harus diawali dengan https://")
+                return@withContext ConnectionCheckResult(
+                    ok = false,
+                    message = "Format URL harus diawali dengan https://"
+                )
             }
 
             val pingUrl = if (cleanUrl.contains("?")) {
@@ -242,7 +305,10 @@ class GoogleSheetsService {
                 val body = response.body?.string() ?: ""
                 val trimmed = body.trim()
                 if (!response.isSuccessful) {
-                    return@withContext Pair(false, "Gagal terhubung ke Web App (HTTP ${response.code}). Periksa URL /exec dan status deployment Apps Script.")
+                    return@withContext ConnectionCheckResult(
+                        ok = false,
+                        message = "Gagal terhubung ke Web App (HTTP ${response.code}). Periksa URL /exec dan status deployment Apps Script."
+                    )
                 }
                 if (!trimmed.startsWith("{")) {
                     val isHtmlLogin = trimmed.contains("ServiceLogin", ignoreCase = true) ||
@@ -254,12 +320,15 @@ class GoogleSheetsService {
                         isHtmlLogin -> "Apps Script meminta login Google. Pastikan 'Who has access' diatur ke 'Anyone' (Siapa saja), lalu Deploy ulang."
                         else -> "Server tidak mengembalikan JSON (HTTP ${response.code}). Pastikan URL berakhiran '/exec' dan akses Web App diset ke 'Anyone'."
                     }
-                    return@withContext Pair(false, hint)
+                    return@withContext ConnectionCheckResult(ok = false, message = hint)
                 }
 
                 val json = try { JSONObject(trimmed) } catch (_: Exception) { null }
                 if (json == null) {
-                    return@withContext Pair(false, "Respons Apps Script tidak valid: ${trimmed.take(120)}")
+                    return@withContext ConnectionCheckResult(
+                        ok = false,
+                        message = "Respons Apps Script tidak valid: ${trimmed.take(120)}"
+                    )
                 }
                 if (json.optString("status", "").equals("error", ignoreCase = true)) {
                     val errMsg = json.optString("message", "Terjadi kesalahan di Apps Script.")
@@ -268,51 +337,48 @@ class GoogleSheetsService {
                     } else {
                         errMsg
                     }
-                    return@withContext Pair(false, friendly)
+                    return@withContext ConnectionCheckResult(ok = false, message = friendly)
                 }
 
                 if (trimmed.contains("success")) {
                     val ssName = json.optString("spreadsheetName", "")
-                    val nameStr = if (ssName.isNotBlank()) " ($ssName)" else " (Aplikasi_Warga)"
-                    val version = json.optInt("version", 1)
-                    val maxGaleriPhotos = json.optInt("maxGaleriPhotos", 0)
-                    val supportsFormula = json.optBoolean("supportsImageFormula", false) || version >= 2
-                    val supports10Cols = version >= 3 || maxGaleriPhotos >= 10
-                    val hasDriveAuthField = json.has("driveAuthorized")
-                    val driveAuthorized = if (hasDriveAuthField) json.optBoolean("driveAuthorized", false) else json.optBoolean("supportsDriveUpload", false)
-                    val supportsDrive = json.optBoolean("supportsDriveUpload", false) && driveAuthorized
+                    val driveError = json.optString("driveError", "")
+                    val caps = ScriptSyncDiagnostics.resolveScriptCapabilities(json)
+                    val supports10Cols = caps.effectiveVersion >= 3 || caps.maxGaleriPhotos >= 10
                     multiPhotoCheckedUrl = cleanUrl
-                    multiPhotoSupportedUrl = if (supportsFormula) cleanUrl else null
+                    multiPhotoSupportedUrl = if (caps.supportsImageFormula) cleanUrl else null
                     galeri10ColsSupportedUrl = if (supports10Cols) cleanUrl else null
-
-                    when {
-                        version < 8 -> {
-                            Pair(
-                                false,
-                                "Terhubung ke Spreadsheet$nameStr, TETAPI script yang aktif di URL ini masih versi lama (v$version). Di Apps Script, klik Simpan (Ctrl+S), jalankan fungsi 'otorisasiDanCekSetup', lalu klik Deploy -> Manage deployments -> Edit -> Version: New version -> Deploy."
-                            )
-                        }
-                        hasDriveAuthField && !driveAuthorized -> {
-                            Pair(
-                                false,
-                                "Terhubung ke Spreadsheet$nameStr (v$version), TETAPI izin Google Drive belum aktif! Di editor Apps Script, pilih fungsi 'otorisasiDanCekSetup' lalu klik Run -> Authorize Access -> Allow."
-                            )
-                        }
-                        supportsFormula && supportsDrive -> {
-                            unsupportedDriveScriptUrl = null
-                            lastDriveUploadError = null
-                            Pair(true, "Koneksi Berhasil! Terhubung ke Spreadsheet$nameStr (Script v$version, mendukung upload Google Drive & rumus =IMAGE).")
-                        }
-                        else -> {
-                            Pair(false, "Terhubung ke Spreadsheet$nameStr, namun fitur foto Drive belum aktif. Jalankan 'otorisasiDanCekSetup' di Apps Script lalu Deploy -> Manage deployments -> Edit -> New version.")
-                        }
+                    if (json.optBoolean("supportsAspirasiMeta", false)) {
+                        aspirasiMetaSupportedUrl = cleanUrl
                     }
+
+                    val (ok, msg) = ScriptSyncDiagnostics.formatConnectionTestResult(
+                        spreadsheetName = ssName,
+                        capabilities = caps,
+                        driveError = driveError
+                    )
+                    if (ok || (caps.effectiveVersion >= 8 && caps.driveAuthorized)) {
+                        unsupportedDriveScriptUrl = null
+                        lastDriveUploadError = null
+                    }
+                    ConnectionCheckResult(
+                        ok = ok,
+                        message = msg,
+                        capabilities = caps,
+                        reachable = true
+                    )
                 } else {
-                    Pair(false, "Respons HTTP ${response.code}: ${trimmed.take(120)}")
+                    ConnectionCheckResult(
+                        ok = false,
+                        message = "Respons HTTP ${response.code}: ${trimmed.take(120)}"
+                    )
                 }
             }
         } catch (e: Exception) {
-            Pair(false, "Koneksi gagal: ${e.localizedMessage ?: "Cek koneksi internet"}")
+            ConnectionCheckResult(
+                ok = false,
+                message = "Koneksi gagal: ${e.localizedMessage ?: "Cek koneksi internet"}"
+            )
         }
     }
 
@@ -329,7 +395,11 @@ class GoogleSheetsService {
         targetId: String? = null
     ): Boolean = withContext(Dispatchers.IO) {
         val cleanUrl = url.trim()
-        if (cleanUrl.isBlank() || cleanUrl.contains("docs.google.com/spreadsheets")) return@withContext false
+        if (cleanUrl.isBlank() || cleanUrl.contains("docs.google.com/spreadsheets")) {
+            lastActionError = "URL Web App Apps Script (/exec) belum valid."
+            return@withContext false
+        }
+        lastActionError = null
 
         try {
             val dataStr = dataJson.toString()
@@ -353,7 +423,7 @@ class GoogleSheetsService {
                 client.newCall(getRequest).execute().use { response ->
                     val resBody = response.body?.string() ?: ""
                     Log.d(TAG, "Spreadsheet GET ($action on $sheet): HTTP ${response.code} - $resBody")
-                    if (isJsonSuccess(response.isSuccessful, resBody)) {
+                    if (evaluateActionResponse(response.isSuccessful, response.code, resBody, cleanUrl)) {
                         return@withContext true
                     }
                 }
@@ -376,10 +446,51 @@ class GoogleSheetsService {
             client.newCall(postRequest).execute().use { response ->
                 val resBody = response.body?.string() ?: ""
                 Log.d(TAG, "Spreadsheet POST ($action on $sheet): HTTP ${response.code} - $resBody")
-                isJsonSuccess(response.isSuccessful, resBody)
+                evaluateActionResponse(response.isSuccessful, response.code, resBody, cleanUrl)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Gagal mengirim aksi ke spreadsheet: ${e.message}", e)
+            lastActionError = e.localizedMessage ?: "Gagal terhubung ke server Spreadsheet"
+            false
+        }
+    }
+
+    private fun evaluateActionResponse(
+        httpOk: Boolean,
+        httpCode: Int,
+        body: String,
+        sourceUrl: String = ""
+    ): Boolean {
+        if (!httpOk) {
+            lastActionError = "Server mengembalikan HTTP $httpCode"
+            return false
+        }
+        val trimmed = body.trim()
+        if (!trimmed.startsWith("{")) {
+            lastActionError = if (trimmed.contains("ServiceLogin", ignoreCase = true) ||
+                trimmed.contains("accounts.google.com", ignoreCase = true)
+            ) {
+                "Apps Script meminta login Google ('Who has access' belum diset ke 'Anyone')"
+            } else {
+                "Respons Apps Script bukan JSON (HTTP $httpCode)"
+            }
+            return false
+        }
+        return try {
+            val json = JSONObject(trimmed)
+            val ok = json.optString("status", "").equals("success", ignoreCase = true)
+            if (ok) {
+                lastActionError = null
+                if (sourceUrl.isNotBlank() && (json.optBoolean("aspirasiMetaSaved", false) || json.optBoolean("supportsAspirasiMeta", false))) {
+                    aspirasiMetaSupportedUrl = sourceUrl
+                }
+            } else {
+                lastActionError = json.optString("message", "").trim()
+                    .ifBlank { "Apps Script mengembalikan status gagal" }
+            }
+            ok
+        } catch (_: Exception) {
+            lastActionError = "Format respons Apps Script tidak valid"
             false
         }
     }
@@ -405,7 +516,11 @@ class GoogleSheetsService {
         allDataJson: JSONObject
     ): Boolean = withContext(Dispatchers.IO) {
         val cleanUrl = url.trim()
-        if (cleanUrl.isBlank() || cleanUrl.contains("docs.google.com/spreadsheets")) return@withContext false
+        if (cleanUrl.isBlank() || cleanUrl.contains("docs.google.com/spreadsheets")) {
+            lastActionError = "URL Web App Apps Script (/exec) belum valid."
+            return@withContext false
+        }
+        lastActionError = null
 
         try {
             val formBody = FormBody.Builder()
@@ -422,10 +537,11 @@ class GoogleSheetsService {
             client.newCall(request).execute().use { response ->
                 val body = response.body?.string() ?: ""
                 Log.d(TAG, "Backup all response: HTTP ${response.code} - $body")
-                isJsonSuccess(response.isSuccessful, body)
+                evaluateActionResponse(response.isSuccessful, response.code, body, cleanUrl)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Gagal backup all data ke spreadsheet: ${e.message}", e)
+            lastActionError = e.localizedMessage ?: "Gagal terhubung ke server Spreadsheet"
             false
         }
     }
@@ -617,8 +733,9 @@ class GoogleSheetsService {
         if (status.equals("error", ignoreCase = true)) {
             throw Exception(json.optString("message", "Terjadi kesalahan di Google Apps Script."))
         }
-        val scriptVersion = json.optInt("version", 1)
-        val hasExplicitV2 = scriptVersion >= 2 || json.optBoolean("supportsImageFormula", false)
+        val caps = ScriptSyncDiagnostics.resolveScriptCapabilities(json)
+        val scriptVersion = caps.effectiveVersion
+        val hasExplicitV2 = caps.supportsImageFormula
         var hasUnreadableImageFormula = false
 
         fun readAndCleanPhoto(raw: String): String {
@@ -835,27 +952,92 @@ class GoogleSheetsService {
         val aspirasiList = mutableListOf<AspirasiItem>()
         val aspirasiArray = json.optJSONArray("aspirasi")
         if (aspirasiArray != null) {
+            fun looksLikePhotoOrFormula(raw: String): Boolean {
+                val t = raw.trim()
+                return t.startsWith("=IMAGE(", ignoreCase = true) ||
+                    t.startsWith("http://", ignoreCase = true) ||
+                    t.startsWith("https://", ignoreCase = true) ||
+                    isUnreadableFormulaCell(t)
+            }
+            fun isValidStatusValue(raw: String): Boolean {
+                return raw.equals("Menunggu", ignoreCase = true) ||
+                    raw.equals("Diproses", ignoreCase = true) ||
+                    raw.equals("Selesai", ignoreCase = true)
+            }
+
             for (i in 0 until aspirasiArray.length()) {
                 val obj = aspirasiArray.optJSONObject(i) ?: continue
+                // Kolom F..J: Foto_Masalah_1..5 (hanya foto masalah, maks 5)
                 val masalahParts = listOf(
-                    readStringAny(obj, "Foto_Masalah_1", "Foto_Masalah", "fotoMasalah1", "fotoMasalah"),
-                    readStringAny(obj, "Foto_Masalah_2", "fotoMasalah2"),
-                    readStringAny(obj, "Foto_Masalah_3", "fotoMasalah3"),
-                    readStringAny(obj, "Foto_Masalah_4", "fotoMasalah4"),
-                    readStringAny(obj, "Foto_Masalah_5", "fotoMasalah5")
+                    readStringAny(obj, "Foto_Masalah_1", "foto_masalah_1", "fotoMasalah1", "Foto_Masalah", "foto_masalah", "fotoMasalah"),
+                    readStringAny(obj, "Foto_Masalah_2", "foto_masalah_2", "fotoMasalah2"),
+                    readStringAny(obj, "Foto_Masalah_3", "foto_masalah_3", "fotoMasalah3"),
+                    readStringAny(obj, "Foto_Masalah_4", "foto_masalah_4", "fotoMasalah4"),
+                    readStringAny(obj, "Foto_Masalah_5", "foto_masalah_5", "fotoMasalah5")
                 ).flatMap { raw ->
                     raw.split(",").map { readAndCleanPhoto(it) }
-                }.filter { it.isNotBlank() }.distinct()
+                }.filter { it.isNotBlank() }.distinct().take(5)
 
+                // Kolom N..R: Foto_pengerjaan_1..5 (hanya foto pengerjaan, maks 5)
                 val pengerjaanParts = listOf(
-                    readStringAny(obj, "Foto_pengerjaan_1", "Foto_Pengerjaan_1", "Foto_Pengerjaan", "fotoPengerjaan1", "fotoPengerjaan"),
-                    readStringAny(obj, "Foto_pengerjaan_2", "Foto_Pengerjaan_2", "fotoPengerjaan2"),
-                    readStringAny(obj, "Foto_pengerjaan_3", "Foto_Pengerjaan_3", "fotoPengerjaan3"),
-                    readStringAny(obj, "Foto_pengerjaan_4", "Foto_Pengerjaan_4", "fotoPengerjaan4"),
-                    readStringAny(obj, "Foto_pengerjaan_5", "Foto_Pengerjaan_5", "fotoPengerjaan5")
+                    readStringAny(obj, "Foto_pengerjaan_1", "Foto_Pengerjaan_1", "foto_pengerjaan_1", "fotoPengerjaan1", "Foto_pengerjaan", "Foto_Pengerjaan", "foto_pengerjaan", "fotoPengerjaan"),
+                    readStringAny(obj, "Foto_pengerjaan_2", "Foto_Pengerjaan_2", "foto_pengerjaan_2", "fotoPengerjaan2"),
+                    readStringAny(obj, "Foto_pengerjaan_3", "Foto_Pengerjaan_3", "foto_pengerjaan_3", "fotoPengerjaan3"),
+                    readStringAny(obj, "Foto_pengerjaan_4", "Foto_Pengerjaan_4", "foto_pengerjaan_4", "fotoPengerjaan4"),
+                    readStringAny(obj, "Foto_pengerjaan_5", "Foto_Pengerjaan_5", "foto_pengerjaan_5", "fotoPengerjaan5")
                 ).flatMap { raw ->
                     raw.split(",").map { readAndCleanPhoto(it) }
-                }.filter { it.isNotBlank() }.distinct()
+                }.filter { it.isNotBlank() }.distinct().take(5)
+
+                // Kolom M: Tanggapan_pengurus
+                val rawTanggapan = readStringAny(
+                    obj,
+                    "Tanggapan_pengurus",
+                    "tanggapan_pengurus",
+                    "tanggapanPengurus",
+                    "Tanggapan_Pengurus",
+                    "Tanggapan pengurus",
+                    "Tanggapan Pengurus",
+                    "Tanggapan",
+                    "tanggapan"
+                )
+                val parsedReplyMeta = com.example.util.AspirasiReplyCodec.parseAndStrip(rawTanggapan)
+
+                // Kolom L: Nama_Pengurus
+                var resolvedNamaPengurus = readStringAny(
+                    obj,
+                    "Nama_Pengurus",
+                    "nama_pengurus",
+                    "namaPengurus",
+                    "Nama Pengurus",
+                    "Penanggap_Nama",
+                    "Penanggap Nama",
+                    "penanggapNama",
+                    "penanggap_nama"
+                ).ifBlank { parsedReplyMeta.penanggapNama }
+
+                // Kolom K: Status (aman dari pergeseran kolom lama yang berisi URL/rumus foto)
+                val rawStatus = readStringAny(obj, "Status", "status")
+                val resolvedStatus = when {
+                    rawStatus.isNotBlank() && !looksLikePhotoOrFormula(rawStatus) -> rawStatus
+                    isValidStatusValue(resolvedNamaPengurus) -> {
+                        val rescued = resolvedNamaPengurus
+                        resolvedNamaPengurus = parsedReplyMeta.penanggapNama
+                        rescued
+                    }
+                    parsedReplyMeta.cleanTanggapan.isNotBlank() || pengerjaanParts.isNotEmpty() -> "Diproses"
+                    else -> "Menunggu"
+                }
+
+                val rawSembunyi = obj.opt("Sembunyikan_Nama") ?: obj.opt("sembunyikanNama") ?: obj.opt("sembunyikan_nama")
+                val sembunyikanNamaVal = when (rawSembunyi) {
+                    is Boolean -> rawSembunyi
+                    is Number -> rawSembunyi.toInt() == 1
+                    is String -> rawSembunyi.trim().equals("true", ignoreCase = true) ||
+                        rawSembunyi.trim() == "1" ||
+                        rawSembunyi.trim().equals("ya", ignoreCase = true)
+                    else -> false
+                }
 
                 aspirasiList.add(
                     AspirasiItem(
@@ -865,23 +1047,34 @@ class GoogleSheetsService {
                         kategori = readStringAny(obj, "Kategori", "kategori").ifEmpty { "Masukan/Saran" },
                         pesan = readStringAny(obj, "Pesan", "pesan"),
                         fotoMasalah = masalahParts.joinToString(","),
-                        status = readStringAny(obj, "Status", "status").ifEmpty { "Menunggu" },
-                        tanggapanPengurus = readStringAny(
-                            obj,
-                            "Tanggapan pengurus",
-                            "Tanggapan_Pengurus",
-                            "Tanggapan Pengurus",
-                            "tanggapanPengurus"
-                        ),
-                        fotoPengerjaan = pengerjaanParts.joinToString(",")
+                        status = resolvedStatus,
+                        penanggapNama = resolvedNamaPengurus,
+                        tanggapanPengurus = parsedReplyMeta.cleanTanggapan,
+                        fotoPengerjaan = pengerjaanParts.joinToString(","),
+                        noRumah = readStringAny(obj, "No_Rumah", "No Rumah", "noRumah", "no_rumah"),
+                        sembunyikanNama = sembunyikanNamaVal,
+                        penanggapUsername = readStringAny(obj, "Penanggap_Username", "Penanggap Username", "penanggapUsername", "penanggap_username"),
+                        penanggapNamaAsli = readStringAny(obj, "Penanggap_Nama_Asli", "Penanggap Nama Asli", "penanggapNamaAsli", "penanggap_nama_asli"),
+                        penanggapPeran = readStringAny(obj, "Penanggap_Peran", "Penanggap Peran", "penanggapPeran", "penanggap_peran")
+                            .ifBlank { parsedReplyMeta.penanggapPeran },
+                        waktuTanggapan = readStringAny(obj, "Waktu_Tanggapan", "Waktu Tanggapan", "waktuTanggapan", "waktu_tanggapan")
+                            .ifBlank { parsedReplyMeta.waktuTanggapan }
                     )
                 )
             }
         }
 
-        val maxGaleriPhotos = json.optInt("maxGaleriPhotos", 0)
+        val maxGaleriPhotos = caps.maxGaleriPhotos
         val hasExplicitV3 = scriptVersion >= 3 || maxGaleriPhotos >= 10
+        val driveAuthorized = caps.driveAuthorized
         if (sourceUrl.isNotBlank()) {
+            if (json.optBoolean("supportsAspirasiMeta", false)) {
+                aspirasiMetaSupportedUrl = sourceUrl
+            }
+            if (scriptVersion >= 8 && driveAuthorized) {
+                unsupportedDriveScriptUrl = null
+                lastDriveUploadError = null
+            }
             if (hasExplicitV3) {
                 multiPhotoSupportedUrl = sourceUrl
                 galeri10ColsSupportedUrl = sourceUrl
@@ -897,13 +1090,6 @@ class GoogleSheetsService {
             }
         }
 
-        val hasDriveField = json.has("driveAuthorized")
-        val driveAuthorized = if (hasDriveField) {
-            json.optBoolean("driveAuthorized", false)
-        } else {
-            json.optBoolean("supportsDriveUpload", false)
-        }
-
         return SheetDataResponse(
             kas = kasList,
             rolling12 = rolling12List,
@@ -916,7 +1102,11 @@ class GoogleSheetsService {
             status = status,
             hasUnreadableImageFormula = hasUnreadableImageFormula,
             scriptVersion = scriptVersion,
-            driveAuthorized = driveAuthorized
+            driveAuthorized = driveAuthorized,
+            hasExplicitVersion = caps.hasExplicitVersion,
+            hasExplicitDriveAuth = caps.hasExplicitDriveAuth,
+            supportsDriveUpload = caps.supportsDriveUpload,
+            maxGaleriPhotos = maxGaleriPhotos
         )
     }
 }

@@ -10,6 +10,8 @@ import com.example.data.model.*
 import com.example.data.source.GoogleSheetsService
 import com.example.data.sync.FirestoreSyncState
 import com.example.data.sync.RoomFirestoreSyncManager
+import com.example.util.ScriptSyncDiagnostics
+import com.example.util.SyncHealthState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -17,6 +19,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -66,6 +70,18 @@ class WargaRepository(private val context: Context) {
     private val _userRole = MutableStateFlow<UserRole>(UserRole.WARGA)
     val userRole: StateFlow<UserRole> = _userRole.asStateFlow()
 
+    private val _currentPengurusAccount = MutableStateFlow<PengurusAccount?>(null)
+    val currentPengurusAccount: StateFlow<PengurusAccount?> = _currentPengurusAccount.asStateFlow()
+
+    private val _activeRoleDisplayName = MutableStateFlow("Warga")
+    val activeRoleDisplayName: StateFlow<String> = _activeRoleDisplayName.asStateFlow()
+
+    private val _pengurusAccounts = MutableStateFlow<List<PengurusAccount>>(loadPengurusAccountsFromPrefs())
+    val pengurusAccounts: StateFlow<List<PengurusAccount>> = _pengurusAccounts.asStateFlow()
+
+    private val _splashDurationMs = MutableStateFlow<Long>(loadSplashDurationFromPrefs())
+    val splashDurationMs: StateFlow<Long> = _splashDurationMs.asStateFlow()
+
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
 
@@ -83,17 +99,130 @@ class WargaRepository(private val context: Context) {
     )
     val sheetUrl: StateFlow<String> = _sheetUrl.asStateFlow()
 
+    private val syncMutex = Mutex()
+    @Volatile
+    private var syncHealthState = SyncHealthState()
+    @Volatile
+    private var lastSuccessfulSyncTimeMs: Long = 0L
+
     private val activeMutationCount = java.util.concurrent.atomic.AtomicInteger(0)
     private val photoUploadSeq = java.util.concurrent.atomic.AtomicInteger(0)
     private val localUnsyncedGaleriIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private val knownGaleriSheetRowIds = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
     private val knownGaleriSheetPhotos = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    sealed class AuthorityLoginResult {
+        data class Success(val role: UserRole, val pengurusAccount: PengurusAccount? = null) : AuthorityLoginResult()
+        data class Failure(val message: String, val isDisabledAccount: Boolean = false) : AuthorityLoginResult()
+    }
+
     companion object {
         private const val TAG = "WargaRepository"
-        const val DEFAULT_PASSWORD = "005011"
+        const val ADMIN_UTAMA_USERNAME = "Adhit"
+        const val ADMIN_UTAMA_PASSWORD = "080309"
+        const val ADMIN_UTAMA_DISPLAY_NAME = "Adithiawan Wijaksana"
         const val ADMIN_CHANGE_PASSWORD_KEY = "Amm080309"
-        const val PREF_KEY_PASSWORD = "authority_password"
+        private const val PREF_KEY_ADMIN_PASSWORD = "admin_authority_password"
+        private const val PREF_KEY_SHEET_SYNC_KEY = "sheet_sync_key"
+        private const val INTERNAL_SHEET_SYNC_KEY = "005011"
+        private const val PREF_KEY_PENGURUS_ACCOUNTS = "pengurus_accounts_json"
+        private const val PREF_KEY_SPLASH_DURATION_MS = "splash_duration_ms"
+        private const val PREF_KEY_ACTIVE_ROLE = "active_session_role"
+        private const val PREF_KEY_SESSION_LOGGED_IN = "active_session_logged_in"
+        private const val PREF_KEY_ACTIVE_PENGURUS_ID = "active_session_pengurus_id"
+        private const val PREF_KEY_ACTIVE_PENGURUS_USERNAME = "active_session_pengurus_username"
+        private const val PREF_KEY_ACTIVE_PENGURUS_NAMA_ASLI = "active_session_pengurus_nama_asli"
+        const val DEFAULT_SPLASH_DURATION_MS = 2000L
+        const val MIN_SPLASH_DURATION_MS = 1000L
+        const val MAX_SPLASH_DURATION_MS = 15000L
+
+        fun clampSplashDurationMs(durationMs: Long): Long {
+            return durationMs.coerceIn(MIN_SPLASH_DURATION_MS, MAX_SPLASH_DURATION_MS)
+        }
+
+        fun resolveAdminDisplayName(pengurusList: List<PengurusItem>): String {
+            val profileById = pengurusList.firstOrNull {
+                it.id.equals("PGR-01", ignoreCase = true) && it.nama.contains("adhit", ignoreCase = true)
+            }
+            val profileByName = profileById ?: pengurusList.firstOrNull {
+                it.nama.contains("adhit", ignoreCase = true)
+            }
+            return profileByName?.nama?.trim().orEmpty().ifBlank { ADMIN_UTAMA_DISPLAY_NAME }
+        }
+
+        fun resolveRoleDisplayName(
+            role: UserRole,
+            activePengurus: PengurusAccount?,
+            pengurusAccounts: List<PengurusAccount>,
+            pengurusList: List<PengurusItem>
+        ): String {
+            return when (role) {
+                UserRole.WARGA -> "Warga"
+                UserRole.ADMIN_UTAMA -> resolveAdminDisplayName(pengurusList)
+                UserRole.PENGURUS -> {
+                    val liveAcc = activePengurus?.let { active ->
+                        pengurusAccounts.firstOrNull {
+                            it.id == active.id || it.username.trim().equals(active.username.trim(), ignoreCase = true)
+                        } ?: active
+                    }
+                    liveAcc?.namaAsli?.trim().orEmpty()
+                        .ifBlank { liveAcc?.username?.trim().orEmpty() }
+                        .ifBlank { "Pengurus" }
+                }
+            }
+        }
+
+        fun resolveAuthorityLogin(
+            username: String,
+            password: String,
+            pengurusAccounts: List<PengurusAccount>,
+            adminPassword: String = ADMIN_UTAMA_PASSWORD
+        ): AuthorityLoginResult {
+            val cleanUser = username.trim()
+            val cleanPass = password.trim()
+            if (cleanPass.isBlank()) {
+                return AuthorityLoginResult.Failure("Lupa ya Broooo.....!")
+            }
+            val isAdminUsername = cleanUser.equals(ADMIN_UTAMA_USERNAME, ignoreCase = true) ||
+                cleanUser.equals("admin", ignoreCase = true) ||
+                cleanUser.isBlank()
+            if (cleanPass == adminPassword.trim() && isAdminUsername) {
+                return AuthorityLoginResult.Success(UserRole.ADMIN_UTAMA, null)
+            }
+            if (cleanUser.isNotBlank()) {
+                val matchedAccount = pengurusAccounts.firstOrNull { account ->
+                    account.username.trim().equals(cleanUser, ignoreCase = true) && account.password == cleanPass
+                }
+                if (matchedAccount != null) {
+                    return if (matchedAccount.aktif) {
+                        AuthorityLoginResult.Success(UserRole.PENGURUS, matchedAccount)
+                    } else {
+                        AuthorityLoginResult.Failure(
+                            message = "Akun pengurus ini sedang dinonaktifkan oleh Admin.",
+                            isDisabledAccount = true
+                        )
+                    }
+                }
+            }
+            return AuthorityLoginResult.Failure("Lupa ya Broooo.....!")
+        }
+
+        fun resolveRealResponderName(
+            item: AspirasiItem,
+            pengurusAccounts: List<PengurusAccount>
+        ): String {
+            if (item.penanggapUsername.equals("Admin", ignoreCase = true) ||
+                item.penanggapUsername.equals(ADMIN_UTAMA_USERNAME, ignoreCase = true)
+            ) {
+                return item.penanggapNamaAsli.ifBlank { ADMIN_UTAMA_DISPLAY_NAME }
+            }
+            val liveAccount = pengurusAccounts.firstOrNull {
+                item.penanggapUsername.isNotBlank() && it.username.trim().equals(item.penanggapUsername.trim(), ignoreCase = true)
+            }
+            return liveAccount?.namaAsli?.takeIf { it.isNotBlank() }
+                ?: item.penanggapNamaAsli.takeIf { it.isNotBlank() }
+                ?: ""
+        }
     }
 
     init {
@@ -101,15 +230,18 @@ class WargaRepository(private val context: Context) {
         if (_kasList.value.isEmpty()) {
             loadInitialDummyData()
         }
+        restorePersistedSession()
         refreshKasRecapDerivedState()
         com.example.util.ReminderScheduler.syncAlarmsAndCheckDue(context, _undanganList.value)
         observeRoomDatabase()
+        observeRemoteSecurityConfig()
         repositoryScope.launch {
+            syncManager.ensureRealtimeSyncConnected()
             if (_sheetUrl.value.isNotBlank()) {
-                val firstAttempt = syncWithSheet()
+                val firstAttempt = syncWithSheet(force = true)
                 if (firstAttempt.isFailure) {
                     delay(2500)
-                    syncWithSheet()
+                    syncWithSheet(force = true)
                 }
             }
         }
@@ -143,58 +275,354 @@ class WargaRepository(private val context: Context) {
         }
     }
 
-    fun getAuthorityPassword(): String {
-        return prefs.getString(PREF_KEY_PASSWORD, DEFAULT_PASSWORD) ?: DEFAULT_PASSWORD
+    private fun observeRemoteSecurityConfig() {
+        repositoryScope.launch {
+            syncManager.remotePengurusAccounts.collect { remoteAccounts ->
+                if (remoteAccounts != null) {
+                    _pengurusAccounts.value = remoteAccounts
+                    savePengurusAccountsToPrefs(remoteAccounts)
+                    enforceActiveSessionConstraint(remoteAccounts)
+                }
+            }
+        }
+        repositoryScope.launch {
+            syncManager.remoteSplashDurationMs.collect { remoteDuration ->
+                if (remoteDuration != null) {
+                    val clamped = clampSplashDurationMs(remoteDuration)
+                    _splashDurationMs.value = clamped
+                    prefs.edit().putLong(PREF_KEY_SPLASH_DURATION_MS, clamped).apply()
+                }
+            }
+        }
+    }
+
+    private fun refreshActiveRoleDisplayName() {
+        _activeRoleDisplayName.value = resolveRoleDisplayName(
+            role = _userRole.value,
+            activePengurus = _currentPengurusAccount.value,
+            pengurusAccounts = _pengurusAccounts.value,
+            pengurusList = _pengurusList.value
+        )
+    }
+
+    private fun persistActiveSession(role: UserRole, pengurusAccount: PengurusAccount?) {
+        val editor = prefs.edit()
+        if (role == UserRole.WARGA) {
+            editor.putBoolean(PREF_KEY_SESSION_LOGGED_IN, false)
+            editor.putString(PREF_KEY_ACTIVE_ROLE, UserRole.WARGA.name)
+            editor.remove(PREF_KEY_ACTIVE_PENGURUS_ID)
+            editor.remove(PREF_KEY_ACTIVE_PENGURUS_USERNAME)
+            editor.remove(PREF_KEY_ACTIVE_PENGURUS_NAMA_ASLI)
+        } else {
+            editor.putBoolean(PREF_KEY_SESSION_LOGGED_IN, true)
+            editor.putString(PREF_KEY_ACTIVE_ROLE, role.name)
+            if (role == UserRole.PENGURUS && pengurusAccount != null) {
+                editor.putString(PREF_KEY_ACTIVE_PENGURUS_ID, pengurusAccount.id)
+                editor.putString(PREF_KEY_ACTIVE_PENGURUS_USERNAME, pengurusAccount.username)
+                editor.putString(PREF_KEY_ACTIVE_PENGURUS_NAMA_ASLI, pengurusAccount.namaAsli)
+            } else {
+                editor.remove(PREF_KEY_ACTIVE_PENGURUS_ID)
+                editor.remove(PREF_KEY_ACTIVE_PENGURUS_USERNAME)
+                editor.remove(PREF_KEY_ACTIVE_PENGURUS_NAMA_ASLI)
+            }
+        }
+        editor.commit()
+    }
+
+    private fun restorePersistedSession() {
+        val isLoggedIn = prefs.getBoolean(PREF_KEY_SESSION_LOGGED_IN, false)
+        val savedRoleName = prefs.getString(PREF_KEY_ACTIVE_ROLE, UserRole.WARGA.name).orEmpty()
+        val parsedRole = UserRole.entries.firstOrNull { it.name == savedRoleName } ?: UserRole.WARGA
+        if (!isLoggedIn || parsedRole == UserRole.WARGA) {
+            _userRole.value = UserRole.WARGA
+            _currentPengurusAccount.value = null
+            refreshActiveRoleDisplayName()
+            return
+        }
+        when (parsedRole) {
+            UserRole.ADMIN_UTAMA -> {
+                _userRole.value = UserRole.ADMIN_UTAMA
+                _currentPengurusAccount.value = null
+            }
+            UserRole.PENGURUS -> {
+                val savedId = prefs.getString(PREF_KEY_ACTIVE_PENGURUS_ID, "").orEmpty().trim()
+                val savedUsername = prefs.getString(PREF_KEY_ACTIVE_PENGURUS_USERNAME, "").orEmpty().trim()
+                val savedNamaAsli = prefs.getString(PREF_KEY_ACTIVE_PENGURUS_NAMA_ASLI, "").orEmpty().trim()
+                val accounts = _pengurusAccounts.value
+                val matched = accounts.firstOrNull { acc ->
+                    (savedId.isNotBlank() && acc.id == savedId) ||
+                        (savedUsername.isNotBlank() && acc.username.trim().equals(savedUsername, ignoreCase = true))
+                }
+                val hasStoredAccountsList = prefs.contains(PREF_KEY_PENGURUS_ACCOUNTS)
+                when {
+                    matched != null && matched.aktif -> {
+                        _userRole.value = UserRole.PENGURUS
+                        _currentPengurusAccount.value = matched
+                    }
+                    matched != null && !matched.aktif -> {
+                        _userRole.value = UserRole.WARGA
+                        _currentPengurusAccount.value = null
+                        persistActiveSession(UserRole.WARGA, null)
+                    }
+                    hasStoredAccountsList || savedUsername.isBlank() -> {
+                        _userRole.value = UserRole.WARGA
+                        _currentPengurusAccount.value = null
+                        persistActiveSession(UserRole.WARGA, null)
+                    }
+                    else -> {
+                        _userRole.value = UserRole.PENGURUS
+                        _currentPengurusAccount.value = PengurusAccount(
+                            id = savedId.ifBlank { "ACC-$savedUsername" },
+                            namaAsli = savedNamaAsli,
+                            username = savedUsername,
+                            password = "",
+                            aktif = true
+                        )
+                    }
+                }
+            }
+            UserRole.WARGA -> {
+                _userRole.value = UserRole.WARGA
+                _currentPengurusAccount.value = null
+            }
+        }
+        refreshActiveRoleDisplayName()
+        applySyncHealthEvaluation()
+    }
+
+    private fun enforceActiveSessionConstraint(accounts: List<PengurusAccount>) {
+        if (_userRole.value == UserRole.PENGURUS) {
+            val activeAcc = _currentPengurusAccount.value
+            val latest = if (activeAcc != null) {
+                accounts.firstOrNull {
+                    it.id == activeAcc.id || it.username.equals(activeAcc.username, ignoreCase = true)
+                }
+            } else null
+            if (latest == null || !latest.aktif) {
+                _currentPengurusAccount.value = null
+                _userRole.value = UserRole.WARGA
+                persistActiveSession(UserRole.WARGA, null)
+                refreshActiveRoleDisplayName()
+                applySyncHealthEvaluation()
+            } else {
+                _currentPengurusAccount.value = latest
+                persistActiveSession(UserRole.PENGURUS, latest)
+                refreshActiveRoleDisplayName()
+            }
+        }
+    }
+
+    private fun loadPengurusAccountsFromPrefs(): List<PengurusAccount> {
+        return try {
+            val raw = prefs.getString(PREF_KEY_PENGURUS_ACCOUNTS, null).orEmpty()
+            if (raw.isBlank()) return emptyList()
+            val arr = JSONArray(raw)
+            val result = mutableListOf<PengurusAccount>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val username = obj.optString("username", "").trim()
+                val password = obj.optString("password", "").trim()
+                if (username.isBlank() || password.isBlank()) continue
+                result.add(
+                    PengurusAccount(
+                        id = obj.optString("id", "ACC-$username"),
+                        namaAsli = obj.optString("namaAsli", ""),
+                        username = username,
+                        password = password,
+                        aktif = obj.optBoolean("aktif", true),
+                        createdAt = obj.optLong("createdAt", System.currentTimeMillis())
+                    )
+                )
+            }
+            result
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun savePengurusAccountsToPrefs(accounts: List<PengurusAccount>) {
+        try {
+            val arr = JSONArray()
+            accounts.forEach { acc ->
+                arr.put(
+                    JSONObject().apply {
+                        put("id", acc.id)
+                        put("namaAsli", acc.namaAsli)
+                        put("username", acc.username)
+                        put("password", acc.password)
+                        put("aktif", acc.aktif)
+                        put("createdAt", acc.createdAt)
+                    }
+                )
+            }
+            prefs.edit().putString(PREF_KEY_PENGURUS_ACCOUNTS, arr.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun loadSplashDurationFromPrefs(): Long {
+        val raw = prefs.getLong(PREF_KEY_SPLASH_DURATION_MS, DEFAULT_SPLASH_DURATION_MS)
+        return clampSplashDurationMs(raw)
+    }
+
+    private fun getAdminPassword(): String {
+        return prefs.getString(PREF_KEY_ADMIN_PASSWORD, ADMIN_UTAMA_PASSWORD)?.trim().orEmpty()
+            .ifBlank { ADMIN_UTAMA_PASSWORD }
+    }
+
+    private fun getSheetSyncKey(): String {
+        return prefs.getString(PREF_KEY_SHEET_SYNC_KEY, null)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: INTERNAL_SHEET_SYNC_KEY
     }
 
     fun updateSheetUrlOnly(url: String) {
         val cleanUrl = url.trim().ifBlank { com.example.data.source.GoogleAppsScriptTemplate.EMBEDDED_WEB_APP_URL }
+        val changed = cleanUrl != _sheetUrl.value
         prefs.edit().putString("sheet_web_app_url", cleanUrl).apply()
         _sheetUrl.value = cleanUrl
         sheetsService.resetCapabilityCache()
+        if (changed) {
+            syncHealthState = SyncHealthState()
+            lastSuccessfulSyncTimeMs = 0L
+            applySyncHealthEvaluation()
+        }
     }
 
     fun setSheetUrl(url: String) {
         updateSheetUrlOnly(url)
         repositoryScope.launch {
-            syncWithSheet()
+            syncWithSheet(force = true)
         }
     }
 
-    @Volatile
-    private var lastRemoteScriptVersion: Int = 1
-
-    @Volatile
-    private var lastRemoteDriveAuthorized: Boolean = false
-
-    private fun updateSyncMessageForSuccess() {
-        _syncMessage.value = if (_userRole.value != UserRole.WARGA && _needsScriptUpdate.value) {
-            when {
-                lastRemoteScriptVersion < 8 ->
-                    "⚠️ Apps Script di URL ini masih v$lastRemoteScriptVersion — foto belum bisa tersimpan ke Spreadsheet. Ketuk untuk update ke v9."
-                !lastRemoteDriveAuthorized ->
-                    "⚠️ Script v$lastRemoteScriptVersion aktif, tapi izin Google Drive belum dijalankan ('otorisasiDanCekSetup'). Ketuk untuk panduan."
-                else ->
-                    "⚠️ Apps Script perlu diperbarui (Deploy New version) agar foto terbaca sempurna."
-            }
-        } else {
-            "🟢 Tersinkron Realtime — Aplikasi_Warga"
-        }
+    private fun applySyncHealthEvaluation() {
+        val eval = ScriptSyncDiagnostics.evaluateSyncHealth(syncHealthState, _userRole.value)
+        _needsScriptUpdate.value = eval.needsScriptUpdate
+        _syncMessage.value = eval.statusMessage
     }
 
-    fun verifyAuthority(password: String): Boolean {
-        val currentPass = getAuthorityPassword()
-        if (password == currentPass) {
-            _userRole.value = UserRole.PENGURUS
-            updateSyncMessageForSuccess()
-            return true
+    fun verifyAuthority(username: String, password: String): AuthorityLoginResult {
+        val result = resolveAuthorityLogin(
+            username = username,
+            password = password,
+            pengurusAccounts = _pengurusAccounts.value,
+            adminPassword = getAdminPassword()
+        )
+        if (result is AuthorityLoginResult.Success) {
+            _userRole.value = result.role
+            _currentPengurusAccount.value = result.pengurusAccount
+            persistActiveSession(result.role, result.pengurusAccount)
+            refreshActiveRoleDisplayName()
+            applySyncHealthEvaluation()
         }
-        return false
+        return result
     }
 
     fun setRole(role: UserRole) {
         _userRole.value = role
-        updateSyncMessageForSuccess()
+        if (role != UserRole.PENGURUS) {
+            _currentPengurusAccount.value = null
+        }
+        persistActiveSession(role, if (role == UserRole.PENGURUS) _currentPengurusAccount.value else null)
+        refreshActiveRoleDisplayName()
+        applySyncHealthEvaluation()
+    }
+
+    fun lockToWargaMode() {
+        setRole(UserRole.WARGA)
+    }
+
+    fun savePengurusAccount(account: PengurusAccount): Pair<Boolean, String> {
+        if (_userRole.value != UserRole.ADMIN_UTAMA) {
+            return Pair(false, "Hanya Admin Induk yang dapat mengelola akun pengurus.")
+        }
+        val cleanNamaAsli = account.namaAsli.trim()
+        val cleanUsername = account.username.trim()
+        val cleanPassword = account.password.trim()
+        if (cleanNamaAsli.isBlank()) return Pair(false, "Nama asli pengurus wajib diisi.")
+        if (cleanUsername.isBlank()) return Pair(false, "Username pengurus wajib diisi.")
+        if (cleanUsername.equals("admin", ignoreCase = true) ||
+            cleanUsername.equals(ADMIN_UTAMA_USERNAME, ignoreCase = true)
+        ) {
+            return Pair(false, "Username '$cleanUsername' dicadangkan untuk Admin Induk.")
+        }
+        if (cleanPassword.isBlank()) return Pair(false, "Password pengurus wajib diisi.")
+
+        val isEdit = account.id.isNotBlank() && _pengurusAccounts.value.any { it.id == account.id }
+        val duplicate = _pengurusAccounts.value.any {
+            it.id != account.id && it.username.trim().equals(cleanUsername, ignoreCase = true)
+        }
+        if (duplicate) {
+            return Pair(false, "Username '$cleanUsername' sudah digunakan pengurus lain.")
+        }
+
+        val finalAccount = account.copy(
+            id = if (account.id.isBlank()) "ACC-${System.currentTimeMillis()}" else account.id,
+            namaAsli = cleanNamaAsli,
+            username = cleanUsername,
+            password = cleanPassword
+        )
+        val updated = _pengurusAccounts.value.toMutableList()
+        if (isEdit) {
+            val idx = updated.indexOfFirst { it.id == finalAccount.id }
+            if (idx != -1) updated[idx] = finalAccount else updated.add(finalAccount)
+        } else {
+            updated.add(0, finalAccount)
+        }
+        _pengurusAccounts.value = updated
+        savePengurusAccountsToPrefs(updated)
+        repositoryScope.launch {
+            syncManager.saveAppSecurityConfig(updated, _splashDurationMs.value)
+        }
+        return Pair(
+            true,
+            if (isEdit) "Akun pengurus '${finalAccount.namaAsli}' diperbarui." else "Akun pengurus '${finalAccount.namaAsli}' berhasil dibuat."
+        )
+    }
+
+    fun togglePengurusAccountActive(accountId: String, aktif: Boolean): Pair<Boolean, String> {
+        if (_userRole.value != UserRole.ADMIN_UTAMA) {
+            return Pair(false, "Hanya Admin Induk yang dapat mengubah status akun pengurus.")
+        }
+        val updated = _pengurusAccounts.value.map { acc ->
+            if (acc.id == accountId) acc.copy(aktif = aktif) else acc
+        }
+        _pengurusAccounts.value = updated
+        savePengurusAccountsToPrefs(updated)
+        repositoryScope.launch {
+            syncManager.saveAppSecurityConfig(updated, _splashDurationMs.value)
+        }
+        val targetName = updated.firstOrNull { it.id == accountId }?.namaAsli ?: "Pengurus"
+        return Pair(true, if (aktif) "Akun '$targetName' diaktifkan." else "Akun '$targetName' dinonaktifkan.")
+    }
+
+    fun deletePengurusAccount(accountId: String): Pair<Boolean, String> {
+        if (_userRole.value != UserRole.ADMIN_UTAMA) {
+            return Pair(false, "Hanya Admin Induk yang dapat menghapus akun pengurus.")
+        }
+        val targetName = _pengurusAccounts.value.firstOrNull { it.id == accountId }?.namaAsli ?: "Pengurus"
+        val updated = _pengurusAccounts.value.filterNot { it.id == accountId }
+        _pengurusAccounts.value = updated
+        savePengurusAccountsToPrefs(updated)
+        repositoryScope.launch {
+            syncManager.saveAppSecurityConfig(updated, _splashDurationMs.value)
+        }
+        return Pair(true, "Akun '$targetName' berhasil dihapus.")
+    }
+
+    fun updateSplashDurationMs(durationMs: Long): Pair<Boolean, String> {
+        if (_userRole.value != UserRole.ADMIN_UTAMA) {
+            return Pair(false, "Hanya Admin Induk yang dapat mengatur durasi Splash Screen.")
+        }
+        val clamped = clampSplashDurationMs(durationMs)
+        _splashDurationMs.value = clamped
+        prefs.edit().putLong(PREF_KEY_SPLASH_DURATION_MS, clamped).apply()
+        repositoryScope.launch {
+            syncManager.saveAppSecurityConfig(_pengurusAccounts.value, clamped)
+        }
+        val seconds = clamped / 1000L
+        return Pair(true, "Durasi layar pembuka diatur menjadi $seconds detik.")
     }
 
     fun verifyChangePasswordAccess(masterPassword: String): Boolean {
@@ -204,17 +632,7 @@ class WargaRepository(private val context: Context) {
     fun changePassword(masterPassword: String, newPass: String): Boolean {
         if (masterPassword == ADMIN_CHANGE_PASSWORD_KEY && newPass.isNotBlank()) {
             val cleanPass = newPass.trim()
-            prefs.edit().putString(PREF_KEY_PASSWORD, cleanPass).apply()
-            val url = _sheetUrl.value
-            if (url.isNotBlank()) {
-                repositoryScope.launch {
-                    val json = JSONObject().apply {
-                        put("masterKey", masterPassword)
-                        put("newPassword", cleanPass)
-                    }
-                    sheetsService.sendAction(url, "update_auth_password", "", cleanPass, json)
-                }
-            }
+            prefs.edit().putString(PREF_KEY_ADMIN_PASSWORD, cleanPass).apply()
             return true
         }
         return false
@@ -242,161 +660,319 @@ class WargaRepository(private val context: Context) {
     }
 
     // --- REALTIME SYNC WITH GOOGLE SHEETS ---
-    suspend fun syncWithSheet(): Result<Unit> = withContext(Dispatchers.IO) {
-        val url = _sheetUrl.value
-        if (url.isBlank()) {
-            _syncMessage.value = "🟢 Terkoneksi ke Spreadsheet: Aplikasi_Warga"
-            return@withContext Result.success(Unit)
+    suspend fun refreshIfStaleOrUnverified(minIntervalMs: Long = 4000L) {
+        syncManager.ensureRealtimeSyncConnected()
+        val elapsed = System.currentTimeMillis() - lastSuccessfulSyncTimeMs
+        if (!syncHealthState.hasVerifiedScriptStatus || !syncHealthState.lastSyncSucceeded || elapsed >= minIntervalMs) {
+            syncWithSheet(force = false)
         }
-        if (activeMutationCount.get() > 0) {
-            return@withContext Result.success(Unit)
-        }
+    }
 
-        _isSyncing.value = true
+    suspend fun refreshOnModeSwitch() {
+        applySyncHealthEvaluation()
+        syncManager.ensureRealtimeSyncConnected()
         try {
-            val response = sheetsService.fetchAllData(url)
+            syncManager.flushPendingSync()
+        } catch (_: Exception) {}
+        if (_sheetUrl.value.isNotBlank()) {
+            syncWithSheet(force = true)
+        }
+    }
+
+    suspend fun syncWithSheet(force: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
+        syncMutex.withLock {
+            syncManager.ensureRealtimeSyncConnected()
+            val url = _sheetUrl.value
+            if (url.isBlank()) {
+                syncHealthState = syncHealthState.copy(isSyncing = false, lastSyncSucceeded = true)
+                applySyncHealthEvaluation()
+                return@withLock Result.success(Unit)
+            }
             if (activeMutationCount.get() > 0) {
-                return@withContext Result.success(Unit)
+                return@withLock Result.success(Unit)
+            }
+            if (!force &&
+                syncHealthState.hasVerifiedScriptStatus &&
+                syncHealthState.lastSyncSucceeded &&
+                (System.currentTimeMillis() - lastSuccessfulSyncTimeMs) < 1500L
+            ) {
+                return@withLock Result.success(Unit)
             }
 
-            val existingKasById = _kasList.value.associateBy { it.id }
-            val existingPgrById = _pengurusList.value.associateBy { it.id }
-            val existingUndById = _undanganList.value.associateBy { it.id }
-            val existingGalById = _galeriList.value.associateBy { it.id }
-            val existingAspById = _aspirasiList.value.associateBy { it.id }
+            try {
+                syncManager.flushPendingSync()
+            } catch (_: Exception) {}
 
-            if (!response.rekapBulanan.isNullOrEmpty()) {
-                cachedRemoteRekapBulanan = com.example.util.KasRecapHelper.normalizeRecapList(response.rekapBulanan)
-            }
-            if (!response.rolling12.isNullOrEmpty()) {
-                cachedRemoteRolling12 = com.example.util.KasRecapHelper.normalizeRecapList(response.rolling12)
-            }
-            if (response.kasSummary != null) {
-                cachedRemoteSummary = response.kasSummary
-            }
-
-            response.kas?.let { rawKas ->
-                val cleanKas = rawKas.filter { it.keterangan.isNotBlank() || it.masuk > 0L || it.keluar > 0L }.map { item ->
-                    val withDesc = if (item.keterangan.isBlank()) {
-                        if (item.keluar > 0L) item.copy(keterangan = "Pengeluaran Operasional / Kas RT")
-                        else item.copy(keterangan = "Iuran / Pemasukan Kas RT")
-                    } else item
-                    withDesc.copy(
-                        periodeBulan = withDesc.periodeBulan.ifBlank {
-                            com.example.util.KasRecapHelper.resolvePeriodeKey("", withDesc.tanggal)
-                        },
-                        buktiFoto = pickPreservedPhoto(withDesc.buktiFoto, existingKasById[withDesc.id]?.buktiFoto)
-                    )
+            _isSyncing.value = true
+            syncHealthState = syncHealthState.copy(isSyncing = true)
+            applySyncHealthEvaluation()
+            try {
+                val response = sheetsService.fetchAllData(url)
+                if (activeMutationCount.get() > 0) {
+                    syncHealthState = syncHealthState.copy(isSyncing = false)
+                    applySyncHealthEvaluation()
+                    return@withLock Result.success(Unit)
                 }
-                val recalculated = recalculateKasBalances(cleanKas)
-                _kasList.value = recalculated
-                saveKasToCache(recalculated)
-                try {
-                    kasDao.clearAllKas()
-                    if (recalculated.isNotEmpty()) {
-                        kasDao.insertKasList(recalculated.map { KasEntity.fromKasItem(it) })
+
+                val existingKasById = _kasList.value.associateBy { it.id }
+                val existingPgrById = _pengurusList.value.associateBy { it.id }
+                val existingUndById = _undanganList.value.associateBy { it.id }
+                val existingGalById = _galeriList.value.associateBy { it.id }
+                val existingAspById = _aspirasiList.value.associateBy { it.id }
+
+                if (!response.rekapBulanan.isNullOrEmpty()) {
+                    cachedRemoteRekapBulanan = com.example.util.KasRecapHelper.normalizeRecapList(response.rekapBulanan)
+                }
+                if (!response.rolling12.isNullOrEmpty()) {
+                    cachedRemoteRolling12 = com.example.util.KasRecapHelper.normalizeRecapList(response.rolling12)
+                }
+                if (response.kasSummary != null) {
+                    cachedRemoteSummary = response.kasSummary
+                }
+
+                response.kas?.let { rawKas ->
+                    val cleanKas = rawKas.filter { it.keterangan.isNotBlank() || it.masuk > 0L || it.keluar > 0L }.map { item ->
+                        val withDesc = if (item.keterangan.isBlank()) {
+                            if (item.keluar > 0L) item.copy(keterangan = "Pengeluaran Operasional / Kas RT")
+                            else item.copy(keterangan = "Iuran / Pemasukan Kas RT")
+                        } else item
+                        withDesc.copy(
+                            periodeBulan = withDesc.periodeBulan.ifBlank {
+                                com.example.util.KasRecapHelper.resolvePeriodeKey("", withDesc.tanggal)
+                            },
+                            buktiFoto = pickPreservedPhoto(withDesc.buktiFoto, existingKasById[withDesc.id]?.buktiFoto)
+                        )
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error updating kas Room DB: ${e.message}")
-                }
-            }
-            refreshKasRecapDerivedState(
-                remoteRekap = cachedRemoteRekapBulanan.ifEmpty { response.rekapBulanan },
-                remoteRolling12 = cachedRemoteRolling12.ifEmpty { response.rolling12 },
-                remoteSummary = response.kasSummary ?: cachedRemoteSummary
-            )
-            response.pengurus?.let { rawPgr ->
-                val cleanPgr = rawPgr.filter { it.nama.isNotBlank() || it.jabatan.isNotBlank() }.map { item ->
-                    item.copy(foto = pickPreservedPhoto(item.foto, existingPgrById[item.id]?.foto))
-                }
-                _pengurusList.value = cleanPgr
-            }
-            response.undangan?.let { rawUnd ->
-                val cleanUnd = rawUnd.filter { it.judul.isNotBlank() }.map { item ->
-                    item.copy(foto = pickPreservedPhoto(item.foto, existingUndById[item.id]?.foto))
-                }
-                _undanganList.value = cleanUnd
-            }
-            response.galeri?.let { rawGal ->
-                val validRows = rawGal.filter { it.judul.isNotBlank() }
-                val rowGroupsByBaseId = validRows.groupBy { com.example.util.GaleriMultiPhotoHelper.baseGaleriId(it.id) }
-                rowGroupsByBaseId.forEach { (baseId, group) ->
-                    knownGaleriSheetRowIds[baseId] = group.map { it.id }
-                }
+                    val pendingKas = try {
+                        kasDao.getPendingSyncKas()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    val pendingDeleteKas = pendingKas.filter { it.syncStatus == KasEntity.SYNC_STATUS_PENDING_DELETE }
+                    val pendingDeleteKasIds = pendingDeleteKas.map { it.id }.toSet()
+                    val pendingUploadKas = pendingKas.filter { it.syncStatus == KasEntity.SYNC_STATUS_PENDING_UPLOAD }
+                    val pendingUploadKasMap = pendingUploadKas.associateBy { it.id }
 
-                val preservedRows = validRows.map { item ->
-                    val baseId = com.example.util.GaleriMultiPhotoHelper.baseGaleriId(item.id)
-                    val partIdx = com.example.util.GaleriMultiPhotoHelper.partIndex(item.id)
-                    val existingItem = existingGalById[item.id] ?: existingGalById[baseId]
-                    val fallbackFromExisting = existingItem?.foto
-                        ?.split(",")
-                        ?.map { it.trim() }
-                        ?.filter { it.isNotBlank() }
-                        ?.let { parts ->
-                            if (item.id == baseId && (rowGroupsByBaseId[baseId]?.size ?: 1) == 1) {
-                                parts.joinToString(",")
+                    val remoteVisibleKas = cleanKas.filterNot { it.id in pendingDeleteKasIds }.map { remoteItem ->
+                        pendingUploadKasMap[remoteItem.id]?.toKasItem() ?: remoteItem
+                    }
+                    val remoteVisibleIds = remoteVisibleKas.map { it.id }.toSet()
+                    val extraPendingUploadKas = pendingUploadKas.filter { it.id !in remoteVisibleIds }
+                    val mergedKas = remoteVisibleKas + extraPendingUploadKas.map { it.toKasItem() }
+
+                    val recalculated = recalculateKasBalances(mergedKas)
+                    _kasList.value = recalculated
+                    saveKasToCache(recalculated)
+                    try {
+                        val recalculatedMap = recalculated.associateBy { it.id }
+                        val entitiesToInsert = recalculated.map { kasItem ->
+                            val status = if (kasItem.id in pendingUploadKasMap) {
+                                KasEntity.SYNC_STATUS_PENDING_UPLOAD
                             } else {
-                                parts.getOrNull(partIdx - 1) ?: ""
+                                KasEntity.SYNC_STATUS_SYNCED
                             }
+                            KasEntity.fromKasItem(recalculatedMap[kasItem.id] ?: kasItem, status)
+                        } + pendingDeleteKas
+                        kasDao.clearAllKas()
+                        if (entitiesToInsert.isNotEmpty()) {
+                            kasDao.insertKasList(entitiesToInsert)
                         }
-                    val fallbackPhoto = knownGaleriSheetPhotos[item.id] ?: fallbackFromExisting
-                    val resolvedPhoto = pickPreservedPhoto(item.foto, fallbackPhoto)
-                    if (resolvedPhoto.isNotBlank()) {
-                        knownGaleriSheetPhotos[item.id] = resolvedPhoto
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error updating kas Room DB: ${e.message}")
                     }
-                    item.copy(foto = resolvedPhoto)
+                }
+                refreshKasRecapDerivedState(
+                    remoteRekap = cachedRemoteRekapBulanan.ifEmpty { response.rekapBulanan },
+                    remoteRolling12 = cachedRemoteRolling12.ifEmpty { response.rolling12 },
+                    remoteSummary = response.kasSummary ?: cachedRemoteSummary
+                )
+                response.pengurus?.let { rawPgr ->
+                    val cleanPgr = rawPgr.filter { it.nama.isNotBlank() || it.jabatan.isNotBlank() }.map { item ->
+                        item.copy(foto = pickPreservedPhoto(item.foto, existingPgrById[item.id]?.foto))
+                    }
+                    _pengurusList.value = cleanPgr
+                    refreshActiveRoleDisplayName()
+                }
+                response.undangan?.let { rawUnd ->
+                    val cleanUnd = rawUnd.filter { it.judul.isNotBlank() }.map { item ->
+                        item.copy(foto = pickPreservedPhoto(item.foto, existingUndById[item.id]?.foto))
+                    }
+                    _undanganList.value = cleanUnd
+                }
+                response.galeri?.let { rawGal ->
+                    val validRows = rawGal.filter { it.judul.isNotBlank() }
+                    val rowGroupsByBaseId = validRows.groupBy { com.example.util.GaleriMultiPhotoHelper.baseGaleriId(it.id) }
+                    rowGroupsByBaseId.forEach { (baseId, group) ->
+                        knownGaleriSheetRowIds[baseId] = group.map { it.id }
+                    }
+
+                    val preservedRows = validRows.map { item ->
+                        val baseId = com.example.util.GaleriMultiPhotoHelper.baseGaleriId(item.id)
+                        val partIdx = com.example.util.GaleriMultiPhotoHelper.partIndex(item.id)
+                        val existingItem = existingGalById[item.id] ?: existingGalById[baseId]
+                        val fallbackFromExisting = existingItem?.foto
+                            ?.split(",")
+                            ?.map { it.trim() }
+                            ?.filter { it.isNotBlank() }
+                            ?.let { parts ->
+                                if (item.id == baseId && (rowGroupsByBaseId[baseId]?.size ?: 1) == 1) {
+                                    parts.joinToString(",")
+                                } else {
+                                    parts.getOrNull(partIdx - 1) ?: ""
+                                }
+                            }
+                        val fallbackPhoto = knownGaleriSheetPhotos[item.id] ?: fallbackFromExisting
+                        val resolvedPhoto = pickPreservedPhoto(item.foto, fallbackPhoto)
+                        if (resolvedPhoto.isNotBlank()) {
+                            knownGaleriSheetPhotos[item.id] = resolvedPhoto
+                        }
+                        item.copy(foto = resolvedPhoto)
+                    }
+
+                    val mergedGal = com.example.util.GaleriMultiPhotoHelper.mergeGroupedGaleriRows(preservedRows)
+                    val remoteBaseIds = mergedGal.map { it.id }.toSet()
+                    localUnsyncedGaleriIds.removeAll(remoteBaseIds)
+                    val pendingLocalGal = _galeriList.value.filter { it.id in localUnsyncedGaleriIds && it.id !in remoteBaseIds }
+                    _galeriList.value = pendingLocalGal + mergedGal
+                }
+                response.aspirasi?.let { rawAsp ->
+                    val cleanAsp = rawAsp.filter { it.nama.isNotBlank() || it.pesan.isNotBlank() }.map { item ->
+                        val existing = existingAspById[item.id]
+                        val hasRemoteReply = item.tanggapanPengurus.isNotBlank() ||
+                            item.fotoPengerjaan.isNotBlank() ||
+                            item.penanggapNama.isNotBlank()
+                        item.copy(
+                            noRumah = item.noRumah.ifBlank { existing?.noRumah.orEmpty() },
+                            sembunyikanNama = item.sembunyikanNama || (existing?.sembunyikanNama == true),
+                            fotoMasalah = AspirasiSheetColumns.splitPhotoSlots(
+                                pickPreservedMultiPhoto(item.fotoMasalah, existing?.fotoMasalah)
+                            ).joinToString(","),
+                            fotoPengerjaan = AspirasiSheetColumns.splitPhotoSlots(
+                                pickPreservedMultiPhoto(item.fotoPengerjaan, existing?.fotoPengerjaan)
+                            ).joinToString(","),
+                            penanggapNama = item.penanggapNama.ifBlank {
+                                if (hasRemoteReply) existing?.penanggapNama.orEmpty() else ""
+                            },
+                            penanggapUsername = item.penanggapUsername.ifBlank {
+                                if (hasRemoteReply) existing?.penanggapUsername.orEmpty() else ""
+                            },
+                            penanggapNamaAsli = item.penanggapNamaAsli.ifBlank {
+                                if (hasRemoteReply) existing?.penanggapNamaAsli.orEmpty() else ""
+                            },
+                            penanggapPeran = item.penanggapPeran.ifBlank {
+                                if (hasRemoteReply) existing?.penanggapPeran.orEmpty() else ""
+                            },
+                            waktuTanggapan = item.waktuTanggapan.ifBlank {
+                                if (hasRemoteReply) existing?.waktuTanggapan.orEmpty() else ""
+                            }
+                        )
+                    }
+                    val pendingAsp = try {
+                        aspirasiDao.getPendingSyncAspirasi()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    val pendingDeleteAsp = pendingAsp.filter { it.syncStatus == AspirasiEntity.SYNC_STATUS_PENDING_DELETE }
+                    val pendingDeleteAspIds = pendingDeleteAsp.map { it.id }.toSet()
+                    val pendingUploadAsp = pendingAsp.filter { it.syncStatus == AspirasiEntity.SYNC_STATUS_PENDING_UPLOAD }
+                    val stillPendingUploadMap = linkedMapOf<String, AspirasiEntity>()
+                    val remoteAspById = cleanAsp.associateBy { it.id }
+
+                    pendingUploadAsp.forEach { entity ->
+                        val localItem = entity.toAspirasiItem()
+                        val remoteItem = remoteAspById[localItem.id]
+                        val hasLocalReply = localItem.tanggapanPengurus.isNotBlank() ||
+                            localItem.fotoPengerjaan.isNotBlank() ||
+                            localItem.penanggapNama.isNotBlank()
+                        val hasRemoteReply = remoteItem != null && (
+                            remoteItem.tanggapanPengurus.isNotBlank() ||
+                                remoteItem.fotoPengerjaan.isNotBlank() ||
+                                remoteItem.penanggapNama.isNotBlank()
+                            )
+                        val needsReplyRetry = hasLocalReply && (remoteItem == null || !hasRemoteReply)
+                        val needsAddRetry = remoteItem == null && !hasLocalReply
+                        // Jika Firebase tidak aktif dan balasan/aspirasi lokal belum masuk Sheet, coba kirim ulang saat sinkronisasi
+                        val syncedToSheetNow = if (!syncManager.isFirebaseConfigured() && url.isNotBlank()) {
+                            when {
+                                needsReplyRetry -> {
+                                    val json = buildAspirasiSheetPayload(
+                                        item = localItem,
+                                        useFallbackCodec = false
+                                    )
+                                    sheetsService.sendAction(url, "respond_aspirasi", "Aspirasi", getSheetSyncKey(), json, localItem.id)
+                                }
+                                needsAddRetry -> {
+                                    val json = buildAspirasiSheetPayload(
+                                        item = localItem,
+                                        useFallbackCodec = false
+                                    )
+                                    sheetsService.sendAction(url, "add", "Aspirasi", "", json)
+                                }
+                                else -> false
+                            }
+                        } else false
+
+                        if (syncedToSheetNow) {
+                            stillPendingUploadMap[entity.id] = entity.copy(syncStatus = AspirasiEntity.SYNC_STATUS_SYNCED)
+                        } else if (remoteItem != null && !needsReplyRetry) {
+                            // Data sudah ada di Spreadsheet tanpa tanggapan lokal yang tertunda:
+                            // Utamakan data terbaru dari Spreadsheet (termasuk perubahan Status Menunggu -> Selesai).
+                        } else {
+                            stillPendingUploadMap[entity.id] = entity
+                        }
+                    }
+
+                    val remoteVisibleAsp = cleanAsp.filterNot { it.id in pendingDeleteAspIds }.map { remoteItem ->
+                        stillPendingUploadMap[remoteItem.id]?.toAspirasiItem() ?: remoteItem
+                    }
+                    val remoteVisibleAspIds = remoteVisibleAsp.map { it.id }.toSet()
+                    val extraPendingUploadAsp = stillPendingUploadMap.values.filter { it.id !in remoteVisibleAspIds }
+                    val mergedAsp = extraPendingUploadAsp.map { it.toAspirasiItem() } + remoteVisibleAsp
+
+                    _aspirasiList.value = mergedAsp
+                    saveAspirasiToCache(mergedAsp)
+                    try {
+                        val entitiesToInsert = mergedAsp.map { aspItem ->
+                            val status = stillPendingUploadMap[aspItem.id]?.syncStatus
+                                ?: AspirasiEntity.SYNC_STATUS_SYNCED
+                            AspirasiEntity.fromAspirasiItem(aspItem, status)
+                        } + pendingDeleteAsp
+                        aspirasiDao.replaceAllAspirasi(entitiesToInsert)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error updating aspirasi Room DB: ${e.message}")
+                    }
                 }
 
-                val mergedGal = com.example.util.GaleriMultiPhotoHelper.mergeGroupedGaleriRows(preservedRows)
-                val remoteBaseIds = mergedGal.map { it.id }.toSet()
-                localUnsyncedGaleriIds.removeAll(remoteBaseIds)
-                val pendingLocalGal = _galeriList.value.filter { it.id in localUnsyncedGaleriIds && it.id !in remoteBaseIds }
-                _galeriList.value = pendingLocalGal + mergedGal
+                saveToCache()
+                com.example.util.RemoteNotificationTracker.processRemoteUpdates(
+                    context = context,
+                    undanganList = if (response.undangan != null) _undanganList.value else emptyList(),
+                    aspirasiList = if (response.aspirasi != null) _aspirasiList.value else emptyList()
+                )
+                lastSuccessfulSyncTimeMs = System.currentTimeMillis()
+                syncHealthState = SyncHealthState(
+                    isSyncing = false,
+                    hasVerifiedScriptStatus = true,
+                    lastSyncSucceeded = true,
+                    scriptVersion = response.scriptVersion,
+                    driveAuthorized = response.driveAuthorized,
+                    hasUnreadableImageFormula = response.hasUnreadableImageFormula,
+                    lastErrorMessage = null
+                )
+                applySyncHealthEvaluation()
+                Result.success(Unit)
+            } catch (e: Exception) {
+                val rawErr = e.localizedMessage ?: "Cek koneksi internet/URL"
+                syncHealthState = syncHealthState.copy(
+                    isSyncing = false,
+                    lastSyncSucceeded = false,
+                    lastErrorMessage = rawErr
+                )
+                applySyncHealthEvaluation()
+                Result.failure(e)
+            } finally {
+                _isSyncing.value = false
             }
-            response.aspirasi?.let { rawAsp ->
-                val cleanAsp = rawAsp.filter { it.nama.isNotBlank() || it.pesan.isNotBlank() }.map { item ->
-                    val existing = existingAspById[item.id]
-                    item.copy(
-                        fotoMasalah = pickPreservedMultiPhoto(item.fotoMasalah, existing?.fotoMasalah),
-                        fotoPengerjaan = pickPreservedMultiPhoto(item.fotoPengerjaan, existing?.fotoPengerjaan)
-                    )
-                }
-                _aspirasiList.value = cleanAsp
-                saveAspirasiToCache(cleanAsp)
-                try {
-                    aspirasiDao.clearAllAspirasi()
-                    if (cleanAsp.isNotEmpty()) {
-                        aspirasiDao.insertAspirasiList(cleanAsp.map { AspirasiEntity.fromAspirasiItem(it) })
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error updating aspirasi Room DB: ${e.message}")
-                }
-            }
-
-            saveToCache()
-            com.example.util.RemoteNotificationTracker.processRemoteUpdates(
-                context = context,
-                undanganList = if (response.undangan != null) _undanganList.value else emptyList(),
-                aspirasiList = if (response.aspirasi != null) _aspirasiList.value else emptyList()
-            )
-            lastRemoteScriptVersion = response.scriptVersion
-            lastRemoteDriveAuthorized = response.driveAuthorized
-            _needsScriptUpdate.value = response.hasUnreadableImageFormula ||
-                response.scriptVersion < 8 ||
-                !response.driveAuthorized
-            updateSyncMessageForSuccess()
-            Result.success(Unit)
-        } catch (e: Exception) {
-            val rawErr = e.localizedMessage ?: "Cek koneksi internet/URL"
-            _syncMessage.value = when {
-                _userRole.value == UserRole.WARGA -> "⚠️ Menunggu koneksi internet untuk sinkronisasi otomatis"
-                rawErr.contains("ReferenceError", ignoreCase = true) ->
-                    "⚠️ Gagal Sync ($rawErr). Kode Apps Script terpotong/belum lengkap. Ketuk di sini -> Salin Script v9, hapus SEMUA kode lama di Apps Script, tempel ulang, Simpan, jalankan 'otorisasiDanCekSetup', lalu Deploy New version."
-                else -> "⚠️ Gagal Sync: $rawErr"
-            }
-            Result.failure(e)
-        } finally {
-            _isSyncing.value = false
         }
     }
 
@@ -480,7 +1056,7 @@ class WargaRepository(private val context: Context) {
                     _sheetUrl.value,
                     if (isEdit) "edit" else "add",
                     "Kas_RT",
-                    getAuthorityPassword(),
+                    getSheetSyncKey(),
                     json,
                     if (isEdit) savedItem.id else null
                 )
@@ -513,7 +1089,7 @@ class WargaRepository(private val context: Context) {
         syncManager.deleteKas(id)
 
         if (_sheetUrl.value.isNotBlank()) {
-            sheetsService.sendAction(_sheetUrl.value, "delete", "Kas_RT", getAuthorityPassword(), JSONObject(), id)
+            sheetsService.sendAction(_sheetUrl.value, "delete", "Kas_RT", getSheetSyncKey(), JSONObject(), id)
         }
         true
     }
@@ -582,6 +1158,7 @@ class WargaRepository(private val context: Context) {
             val idx = updatedList.indexOfFirst { it.id == itemId }
             if (idx != -1) updatedList[idx] = fullItem
             _pengurusList.value = updatedList
+            refreshActiveRoleDisplayName()
             saveToCache()
 
             val sheetOk = if (_sheetUrl.value.isNotBlank()) {
@@ -595,7 +1172,7 @@ class WargaRepository(private val context: Context) {
                     put("foto", toSheetImageFormula(fullItem.foto))
                 }
                 val action = if (isEdit) "edit" else "add"
-                sheetsService.sendAction(_sheetUrl.value, action, "Pengurus", getAuthorityPassword(), json, fullItem.id)
+                sheetsService.sendAction(_sheetUrl.value, action, "Pengurus", getSheetSyncKey(), json, fullItem.id)
             } else false
 
             CloudSaveResult(
@@ -619,7 +1196,7 @@ class WargaRepository(private val context: Context) {
         _pengurusList.value = _pengurusList.value.filter { it.id != id }
         saveToCache()
         if (_sheetUrl.value.isNotBlank()) {
-            sheetsService.sendAction(_sheetUrl.value, "delete", "Pengurus", getAuthorityPassword(), JSONObject(), id)
+            sheetsService.sendAction(_sheetUrl.value, "delete", "Pengurus", getSheetSyncKey(), JSONObject(), id)
         }
         true
     }
@@ -683,7 +1260,7 @@ class WargaRepository(private val context: Context) {
             val sheetOk = if (_sheetUrl.value.isNotBlank()) {
                 val json = buildUndanganJson(resolvedItem, forSheet = true)
                 val action = if (isEdit) "edit" else "add"
-                sheetsService.sendAction(_sheetUrl.value, action, "Undangan", getAuthorityPassword(), json, resolvedItem.id)
+                sheetsService.sendAction(_sheetUrl.value, action, "Undangan", getSheetSyncKey(), json, resolvedItem.id)
             } else false
 
             val entityLabel = if (resolvedItem.isPengumuman) "Pengumuman" else "Undangan"
@@ -711,7 +1288,7 @@ class WargaRepository(private val context: Context) {
             _undanganList.value = _undanganList.value.filter { it.id != id }
             saveToCache()
             if (_sheetUrl.value.isNotBlank()) {
-                sheetsService.sendAction(_sheetUrl.value, "delete", "Undangan", getAuthorityPassword(), JSONObject(), id)
+                sheetsService.sendAction(_sheetUrl.value, "delete", "Undangan", getSheetSyncKey(), JSONObject(), id)
             }
             true
         } finally {
@@ -770,7 +1347,7 @@ class WargaRepository(private val context: Context) {
                     _sheetUrl.value,
                     "edit",
                     "Undangan",
-                    getAuthorityPassword(),
+                    getSheetSyncKey(),
                     buildUndanganJson(updatedItem, forSheet = true),
                     updatedItem.id
                 )
@@ -811,7 +1388,7 @@ class WargaRepository(private val context: Context) {
                     _sheetUrl.value,
                     "edit",
                     "Undangan",
-                    getAuthorityPassword(),
+                    getSheetSyncKey(),
                     buildUndanganJson(updatedItem, forSheet = true),
                     updatedItem.id
                 )
@@ -851,29 +1428,38 @@ class WargaRepository(private val context: Context) {
         entityName: String,
         photoRequested: Boolean,
         photoUploaded: Boolean,
-        sheetSynced: Boolean
+        sheetSynced: Boolean,
+        firestoreSynced: Boolean = false
     ): String {
         val isWarga = _userRole.value == UserRole.WARGA
         val driveErr = sheetsService.lastDriveUploadError?.takeIf { it.isNotBlank() }
-        val errSuffix = if (driveErr != null && !isWarga) " ($driveErr)" else ""
+        val actionErr = sheetsService.lastActionError?.takeIf { it.isNotBlank() }
+        val driveSuffix = if (driveErr != null && !isWarga) " ($driveErr)" else ""
+        val sheetErrSuffix = if (actionErr != null && !isWarga) " ($actionErr)" else ""
         return when {
             photoRequested && photoUploaded && sheetSynced ->
                 "$entityName & foto berhasil diunggah ke Cloud dan dicatat ke Spreadsheet (=IMAGE)."
             !photoRequested && sheetSynced ->
                 "$entityName berhasil disimpan & dicatat ke Spreadsheet!"
             photoRequested && !photoUploaded && sheetSynced ->
-                "$entityName masuk ke Spreadsheet, namun foto gagal diunggah ke Google Drive/Cloud$errSuffix."
+                "$entityName masuk ke Spreadsheet, namun foto gagal diunggah ke Google Drive/Cloud$driveSuffix."
             photoRequested && photoUploaded && !sheetSynced ->
-                if (isWarga) {
-                    "Foto berhasil diunggah, namun $entityName belum terkirim ke server RT. Periksa koneksi internet Anda."
-                } else {
-                    "Foto berhasil diunggah ke Cloud, namun $entityName gagal dicatat ke Spreadsheet. Periksa koneksi / URL Apps Script."
+                when {
+                    firestoreSynced ->
+                        "Foto & $entityName tersimpan ke Cloud Firestore, namun gagal dicatat ke Spreadsheet$sheetErrSuffix."
+                    isWarga ->
+                        "Foto berhasil diunggah, namun $entityName belum terkirim ke server RT$sheetErrSuffix. Periksa koneksi internet Anda."
+                    else ->
+                        "Foto berhasil diunggah ke Cloud, namun $entityName gagal dicatat ke Spreadsheet$sheetErrSuffix."
                 }
             else ->
-                if (isWarga) {
-                    "$entityName tersimpan di HP, akan dikirim ulang saat koneksi internet tersedia."
-                } else {
-                    "$entityName tersimpan di HP, namun gagal dikirim ke Spreadsheet. Periksa koneksi internet / URL Apps Script."
+                when {
+                    firestoreSynced ->
+                        "$entityName tersimpan ke Cloud Firestore, namun gagal dicatat ke Spreadsheet$sheetErrSuffix."
+                    isWarga ->
+                        "$entityName tersimpan di HP, akan dikirim ulang saat koneksi internet tersedia."
+                    else ->
+                        "$entityName tersimpan di HP, namun gagal dikirim ke Spreadsheet$sheetErrSuffix. Periksa koneksi internet / URL Apps Script."
                 }
         }
     }
@@ -899,7 +1485,7 @@ class WargaRepository(private val context: Context) {
         if (_sheetUrl.value.isNotBlank() && base64Data.isNotBlank()) {
             val driveUrl = sheetsService.uploadPhotoToDrive(
                 _sheetUrl.value,
-                getAuthorityPassword(),
+                getSheetSyncKey(),
                 base64Data,
                 filename
             )
@@ -989,7 +1575,7 @@ class WargaRepository(private val context: Context) {
                         url,
                         sheetAction,
                         "Galeri",
-                        getAuthorityPassword(),
+                        getSheetSyncKey(),
                         json,
                         if (isEdit) itemId else null
                     )
@@ -1001,7 +1587,7 @@ class WargaRepository(private val context: Context) {
                         }
                         if (isEdit) {
                             previousRowIds.filter { it != itemId }.forEach { obsoleteId ->
-                                sheetsService.sendAction(url, "delete", "Galeri", getAuthorityPassword(), JSONObject(), obsoleteId)
+                                sheetsService.sendAction(url, "delete", "Galeri", getSheetSyncKey(), JSONObject(), obsoleteId)
                             }
                         }
                     }
@@ -1013,7 +1599,7 @@ class WargaRepository(private val context: Context) {
                     val savedRowIds = mutableListOf<String>()
                     chunkedRows.forEachIndexed { rIdx, (rowId, json) ->
                         if (rIdx > 0) delay(150)
-                        if (sheetsService.sendAction(url, sheetAction, "Galeri", getAuthorityPassword(), json, if (isEdit) rowId else null)) {
+                        if (sheetsService.sendAction(url, sheetAction, "Galeri", getSheetSyncKey(), json, if (isEdit) rowId else null)) {
                             sentCount++
                             savedRowIds.add(rowId)
                         }
@@ -1022,7 +1608,7 @@ class WargaRepository(private val context: Context) {
                         knownGaleriSheetRowIds[itemId] = savedRowIds
                         if (isEdit) {
                             previousRowIds.filter { it !in savedRowIds }.forEach { obsoleteId ->
-                                sheetsService.sendAction(url, "delete", "Galeri", getAuthorityPassword(), JSONObject(), obsoleteId)
+                                sheetsService.sendAction(url, "delete", "Galeri", getSheetSyncKey(), JSONObject(), obsoleteId)
                             }
                         }
                     }
@@ -1041,7 +1627,7 @@ class WargaRepository(private val context: Context) {
                     val savedRowIds = mutableListOf<String>()
                     expandedRows.forEachIndexed { rIdx, rowPayload ->
                         if (rIdx > 0) delay(150)
-                        if (sheetsService.sendAction(url, sheetAction, "Galeri", getAuthorityPassword(), rowPayload.json, if (isEdit) rowPayload.rowId else null)) {
+                        if (sheetsService.sendAction(url, sheetAction, "Galeri", getSheetSyncKey(), rowPayload.json, if (isEdit) rowPayload.rowId else null)) {
                             sentCount++
                             savedRowIds.add(rowPayload.rowId)
                             knownGaleriSheetPhotos[rowPayload.rowId] =
@@ -1052,7 +1638,7 @@ class WargaRepository(private val context: Context) {
                         knownGaleriSheetRowIds[itemId] = savedRowIds
                         if (isEdit) {
                             previousRowIds.filter { it !in savedRowIds }.forEach { obsoleteId ->
-                                sheetsService.sendAction(url, "delete", "Galeri", getAuthorityPassword(), JSONObject(), obsoleteId)
+                                sheetsService.sendAction(url, "delete", "Galeri", getSheetSyncKey(), JSONObject(), obsoleteId)
                             }
                         }
                     }
@@ -1100,16 +1686,66 @@ class WargaRepository(private val context: Context) {
             rowIdsToDelete.forEachIndexed { idx, rowId ->
                 knownGaleriSheetPhotos.remove(rowId)
                 if (idx > 0) delay(80)
-                sheetsService.sendAction(_sheetUrl.value, "delete", "Galeri", getAuthorityPassword(), JSONObject(), rowId)
+                sheetsService.sendAction(_sheetUrl.value, "delete", "Galeri", getSheetSyncKey(), JSONObject(), rowId)
             }
         }
         true
     }
 
+    internal fun buildAspirasiSheetPayload(
+        item: AspirasiItem,
+        useFallbackCodec: Boolean = false
+    ): JSONObject {
+        val masalahFormulas = item.fotoMasalahSlots
+            .map { toSheetImageFormula(it) }
+            .filter { it.isNotBlank() }
+        val pengerjaanFormulas = item.fotoPengerjaanSlots
+            .map { toSheetImageFormula(it) }
+            .filter { it.isNotBlank() }
+        val cleanTanggapan = com.example.util.AspirasiReplyCodec.stripMarker(item.tanggapanPengurus)
+        val tanggapanPayload = if (useFallbackCodec && cleanTanggapan.isNotBlank()) {
+            com.example.util.AspirasiReplyCodec.encodeIntoTanggapan(
+                rawTanggapan = cleanTanggapan,
+                penanggapNama = item.penanggapNama,
+                penanggapPeran = item.penanggapPeran,
+                waktuTanggapan = item.waktuTanggapan
+            )
+        } else {
+            cleanTanggapan
+        }
+        return JSONObject().apply {
+            // Kolom A..K: data aspirasi warga & status
+            put("id", item.id)
+            put("tanggal", item.tanggal)
+            put("nama", item.nama)
+            put("kategori", item.kategori)
+            put("pesan", item.pesan)
+            put("fotoMasalah", masalahFormulas.getOrNull(0) ?: "")
+            put("fotoMasalah1", masalahFormulas.getOrNull(0) ?: "")
+            put("fotoMasalah2", masalahFormulas.getOrNull(1) ?: "")
+            put("fotoMasalah3", masalahFormulas.getOrNull(2) ?: "")
+            put("fotoMasalah4", masalahFormulas.getOrNull(3) ?: "")
+            put("fotoMasalah5", masalahFormulas.getOrNull(4) ?: "")
+            put("status", item.status.ifBlank { "Menunggu" })
+            // Kolom L..R: Nama_Pengurus, Tanggapan_pengurus, Foto_pengerjaan_1..5
+            put("namaPengurus", item.penanggapNama)
+            put("Nama_Pengurus", item.penanggapNama)
+            put("penanggapNama", item.penanggapNama)
+            put("tanggapanPengurus", tanggapanPayload)
+            put("Tanggapan_pengurus", tanggapanPayload)
+            put("fotoPengerjaan", pengerjaanFormulas.getOrNull(0) ?: "")
+            put("fotoPengerjaan1", pengerjaanFormulas.getOrNull(0) ?: "")
+            put("fotoPengerjaan2", pengerjaanFormulas.getOrNull(1) ?: "")
+            put("fotoPengerjaan3", pengerjaanFormulas.getOrNull(2) ?: "")
+            put("fotoPengerjaan4", pengerjaanFormulas.getOrNull(3) ?: "")
+            put("fotoPengerjaan5", pengerjaanFormulas.getOrNull(4) ?: "")
+        }
+    }
+
     // --- ASPIRASI ACTIONS ---
     suspend fun submitAspirasiWarga(item: AspirasiItem): CloudSaveResult = withContext(Dispatchers.IO) {
         activeMutationCount.incrementAndGet()
-        try {
+        val saveResult = try {
             val itemId = if (item.id.isBlank()) "ASP-${System.currentTimeMillis()}" else item.id
             val rawMasalahPhotos = item.fotoMasalah.split(",").map { it.trim() }.filter { it.isNotBlank() }.distinct().take(5)
             val persistentPhotos = rawMasalahPhotos.map {
@@ -1147,42 +1783,26 @@ class WargaRepository(private val context: Context) {
             _aspirasiList.value = updated
             saveToCache()
 
-            syncManager.saveAspirasi(fullItem)
+            val firestoreSynced = syncManager.saveAspirasi(fullItem)
             com.example.util.RemoteNotificationTracker.markLocalAspirasiSubmitted(context, fullItem)
 
+            val notifSender = if (fullItem.sembunyikanNama) "Warga RT 005" else fullItem.nama
             com.example.util.NotificationHelper.showPushNotification(
                 context = context,
                 title = "🚨 Aspirasi Baru dari Warga!",
-                message = "${fullItem.nama} (${fullItem.kategori}): ${fullItem.pesan}",
+                message = "$notifSender (${fullItem.kategori}): ${fullItem.pesan}",
                 channelId = com.example.util.NotificationHelper.CHANNEL_ASPIRASI,
                 type = "ASPIRASI"
             )
 
             val sheetOk = if (_sheetUrl.value.isNotBlank()) {
-                val masalahFormulas = processedPhotos.map { toSheetImageFormula(it) }.filter { it.isNotBlank() }
-                val json = JSONObject().apply {
-                    put("id", fullItem.id)
-                    put("tanggal", fullItem.tanggal)
-                    put("nama", fullItem.nama)
-                    put("kategori", fullItem.kategori)
-                    put("pesan", fullItem.pesan)
-                    put("fotoMasalah", masalahFormulas.getOrNull(0) ?: "")
-                    put("fotoMasalah1", masalahFormulas.getOrNull(0) ?: "")
-                    put("fotoMasalah2", masalahFormulas.getOrNull(1) ?: "")
-                    put("fotoMasalah3", masalahFormulas.getOrNull(2) ?: "")
-                    put("fotoMasalah4", masalahFormulas.getOrNull(3) ?: "")
-                    put("fotoMasalah5", masalahFormulas.getOrNull(4) ?: "")
-                    put("status", fullItem.status)
-                    put("tanggapanPengurus", "")
-                    put("fotoPengerjaan", "")
-                    put("fotoPengerjaan1", "")
-                    put("fotoPengerjaan2", "")
-                    put("fotoPengerjaan3", "")
-                    put("fotoPengerjaan4", "")
-                    put("fotoPengerjaan5", "")
-                }
+                val json = buildAspirasiSheetPayload(fullItem, useFallbackCodec = false)
                 sheetsService.sendAction(_sheetUrl.value, "add", "Aspirasi", "", json)
             } else false
+
+            if (sheetOk && !syncManager.isFirebaseConfigured()) {
+                syncManager.markAspirasiSynced(fullItem)
+            }
 
             CloudSaveResult(
                 localSaved = true,
@@ -1193,29 +1813,64 @@ class WargaRepository(private val context: Context) {
                     entityName = if (processedPhotos.size > 1) "Aspirasi Warga (${processedPhotos.size} foto)" else "Aspirasi Warga",
                     photoRequested = photoRequested,
                     photoUploaded = photoUploaded,
-                    sheetSynced = sheetOk
+                    sheetSynced = sheetOk,
+                    firestoreSynced = firestoreSynced
                 )
             )
         } finally {
             activeMutationCount.decrementAndGet()
         }
+        if (saveResult.sheetSynced && _sheetUrl.value.isNotBlank()) {
+            syncWithSheet(force = true)
+        }
+        saveResult
     }
 
-    suspend fun respondAspirasi(id: String, status: String, tanggapan: String, fotoPengerjaan: String): CloudSaveResult = withContext(Dispatchers.IO) {
+    suspend fun respondAspirasi(
+        id: String,
+        status: String,
+        tanggapan: String,
+        fotoPengerjaan: String,
+        namaPenanggap: String
+    ): CloudSaveResult = withContext(Dispatchers.IO) {
         activeMutationCount.incrementAndGet()
-        try {
+        val saveResult = try {
             val baseList = _aspirasiList.value.toMutableList()
             val index = baseList.indexOfFirst { it.id == id }
             if (index != -1) {
                 val current = baseList[index]
+                val cleanTanggapan = com.example.util.AspirasiReplyCodec.stripMarker(tanggapan).trim()
+                val cleanNamaPenanggap = namaPenanggap.trim()
+                val activeAccount = _currentPengurusAccount.value
+                val resolvedUsername = when (_userRole.value) {
+                    UserRole.ADMIN_UTAMA -> ADMIN_UTAMA_USERNAME
+                    UserRole.PENGURUS -> activeAccount?.username?.trim().orEmpty()
+                    UserRole.WARGA -> ""
+                }
+                val resolvedNamaAsli = when (_userRole.value) {
+                    UserRole.ADMIN_UTAMA -> resolveAdminDisplayName(_pengurusList.value)
+                    UserRole.PENGURUS -> activeAccount?.namaAsli?.trim().orEmpty().ifBlank { resolvedUsername }
+                    UserRole.WARGA -> ""
+                }
+                val resolvedPeran = when (_userRole.value) {
+                    UserRole.ADMIN_UTAMA -> "Admin"
+                    UserRole.PENGURUS -> "Pengurus"
+                    UserRole.WARGA -> current.penanggapPeran
+                }
+                val resolvedWaktuTanggapan = com.example.util.IndonesianDateHelper.nowWibIsoTimestamp()
                 val rawPengerjaanPhotos = fotoPengerjaan.split(",").map { it.trim() }.filter { it.isNotBlank() }.distinct().take(5)
                 val persistentPhotos = rawPengerjaanPhotos.map {
                     com.example.util.PhotoStorageHelper.ensurePersistentUri(context, it)
                 }.filter { it.isNotBlank() }
                 val optimisticItem = current.copy(
                     status = status,
-                    tanggapanPengurus = tanggapan,
-                    fotoPengerjaan = persistentPhotos.joinToString(",")
+                    tanggapanPengurus = cleanTanggapan,
+                    fotoPengerjaan = persistentPhotos.joinToString(","),
+                    penanggapNama = cleanNamaPenanggap,
+                    penanggapUsername = resolvedUsername.ifBlank { current.penanggapUsername },
+                    penanggapNamaAsli = resolvedNamaAsli.ifBlank { current.penanggapNamaAsli },
+                    penanggapPeran = resolvedPeran.ifBlank { current.penanggapPeran },
+                    waktuTanggapan = resolvedWaktuTanggapan
                 )
                 baseList[index] = optimisticItem
                 _aspirasiList.value = baseList
@@ -1241,31 +1896,36 @@ class WargaRepository(private val context: Context) {
                 _aspirasiList.value = updated
                 saveToCache()
 
-                syncManager.saveAspirasi(updatedItem)
+                val firestoreSynced = syncManager.saveAspirasi(updatedItem)
                 com.example.util.RemoteNotificationTracker.markLocalAspirasiResponded(context, updatedItem)
 
+                val notifRecipient = if (updatedItem.sembunyikanNama) "Warga RT 005" else updatedItem.nama
                 com.example.util.NotificationHelper.showPushNotification(
                     context = context,
                     title = "✅ Tanggapan Pengurus RT",
-                    message = "Untuk ${updatedItem.nama}: Status [$status] - $tanggapan",
+                    message = "Untuk $notifRecipient: Status [$status] - $cleanTanggapan",
                     channelId = com.example.util.NotificationHelper.CHANNEL_ASPIRASI,
                     type = "ASPIRASI"
                 )
 
                 val sheetOk = if (_sheetUrl.value.isNotBlank()) {
-                    val pengerjaanFormulas = processedPhotos.map { toSheetImageFormula(it) }.filter { it.isNotBlank() }
-                    val json = JSONObject().apply {
-                        put("status", status)
-                        put("tanggapanPengurus", tanggapan)
-                        put("fotoPengerjaan", pengerjaanFormulas.getOrNull(0) ?: "")
-                        put("fotoPengerjaan1", pengerjaanFormulas.getOrNull(0) ?: "")
-                        put("fotoPengerjaan2", pengerjaanFormulas.getOrNull(1) ?: "")
-                        put("fotoPengerjaan3", pengerjaanFormulas.getOrNull(2) ?: "")
-                        put("fotoPengerjaan4", pengerjaanFormulas.getOrNull(3) ?: "")
-                        put("fotoPengerjaan5", pengerjaanFormulas.getOrNull(4) ?: "")
-                    }
-                    sheetsService.sendAction(_sheetUrl.value, "respond_aspirasi", "Aspirasi", getAuthorityPassword(), json, id)
+                    val json = buildAspirasiSheetPayload(
+                        item = updatedItem,
+                        useFallbackCodec = false
+                    )
+                    sheetsService.sendAction(
+                        _sheetUrl.value,
+                        "respond_aspirasi",
+                        "Aspirasi",
+                        getSheetSyncKey(),
+                        json,
+                        id
+                    )
                 } else false
+
+                if (sheetOk && !syncManager.isFirebaseConfigured()) {
+                    syncManager.markAspirasiSynced(updatedItem)
+                }
 
                 CloudSaveResult(
                     localSaved = true,
@@ -1276,7 +1936,8 @@ class WargaRepository(private val context: Context) {
                         entityName = "Tanggapan Pengurus",
                         photoRequested = photoRequested,
                         photoUploaded = photoUploaded,
-                        sheetSynced = sheetOk
+                        sheetSynced = sheetOk,
+                        firestoreSynced = firestoreSynced
                     )
                 )
             } else {
@@ -1291,6 +1952,10 @@ class WargaRepository(private val context: Context) {
         } finally {
             activeMutationCount.decrementAndGet()
         }
+        if (saveResult.sheetSynced && _sheetUrl.value.isNotBlank()) {
+            syncWithSheet(force = true)
+        }
+        saveResult
     }
 
     suspend fun deleteAspirasi(id: String): Boolean = withContext(Dispatchers.IO) {
@@ -1301,7 +1966,7 @@ class WargaRepository(private val context: Context) {
         syncManager.deleteAspirasi(id)
 
         if (_sheetUrl.value.isNotBlank()) {
-            sheetsService.sendAction(_sheetUrl.value, "delete", "Aspirasi", getAuthorityPassword(), JSONObject(), id)
+            sheetsService.sendAction(_sheetUrl.value, "delete", "Aspirasi", getSheetSyncKey(), JSONObject(), id)
         }
         true
     }
@@ -1314,7 +1979,28 @@ class WargaRepository(private val context: Context) {
         } else {
             sheetsService.resetCapabilityCache()
         }
-        sheetsService.testConnection(targetUrl)
+        val result = sheetsService.testConnectionDetailed(targetUrl)
+        if (result.reachable && result.capabilities != null) {
+            val caps = result.capabilities
+            syncHealthState = syncHealthState.copy(
+                isSyncing = false,
+                hasVerifiedScriptStatus = true,
+                lastSyncSucceeded = result.ok,
+                scriptVersion = caps.effectiveVersion,
+                driveAuthorized = caps.driveAuthorized,
+                lastErrorMessage = if (result.ok) null else result.message
+            )
+            if (result.ok) {
+                lastSuccessfulSyncTimeMs = System.currentTimeMillis()
+            }
+            applySyncHealthEvaluation()
+            if (result.ok && targetUrl == _sheetUrl.value) {
+                repositoryScope.launch {
+                    syncWithSheet(force = true)
+                }
+            }
+        }
+        Pair(result.ok, result.message)
     }
 
     suspend fun backupAllToSpreadsheet(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
@@ -1414,31 +2100,7 @@ class WargaRepository(private val context: Context) {
                 com.example.util.GaleriMultiPhotoHelper.expandRowsForSingleColumnSheet(g, formulas)
             }
             val aspPayloads = resolvedAsp.map { a ->
-                val masalahFormulas = a.fotoMasalah.split(",").map { it.trim() }.filter { it.isNotBlank() }.take(5)
-                    .map { toSheetImageFormula(it) }.filter { it.isNotBlank() }
-                val pengerjaanFormulas = a.fotoPengerjaan.split(",").map { it.trim() }.filter { it.isNotBlank() }.take(5)
-                    .map { toSheetImageFormula(it) }.filter { it.isNotBlank() }
-                a.id to JSONObject().apply {
-                    put("id", a.id)
-                    put("tanggal", a.tanggal)
-                    put("nama", a.nama)
-                    put("kategori", a.kategori)
-                    put("pesan", a.pesan)
-                    put("fotoMasalah", masalahFormulas.getOrNull(0) ?: "")
-                    put("fotoMasalah1", masalahFormulas.getOrNull(0) ?: "")
-                    put("fotoMasalah2", masalahFormulas.getOrNull(1) ?: "")
-                    put("fotoMasalah3", masalahFormulas.getOrNull(2) ?: "")
-                    put("fotoMasalah4", masalahFormulas.getOrNull(3) ?: "")
-                    put("fotoMasalah5", masalahFormulas.getOrNull(4) ?: "")
-                    put("status", a.status)
-                    put("tanggapanPengurus", a.tanggapanPengurus)
-                    put("fotoPengerjaan", pengerjaanFormulas.getOrNull(0) ?: "")
-                    put("fotoPengerjaan1", pengerjaanFormulas.getOrNull(0) ?: "")
-                    put("fotoPengerjaan2", pengerjaanFormulas.getOrNull(1) ?: "")
-                    put("fotoPengerjaan3", pengerjaanFormulas.getOrNull(2) ?: "")
-                    put("fotoPengerjaan4", pengerjaanFormulas.getOrNull(3) ?: "")
-                    put("fotoPengerjaan5", pengerjaanFormulas.getOrNull(4) ?: "")
-                }
+                a.id to buildAspirasiSheetPayload(a, useFallbackCodec = false)
             }
 
             if (supportsMultiPhotoCols) {
@@ -1450,7 +2112,7 @@ class WargaRepository(private val context: Context) {
                     put("aspirasi", JSONArray().apply { aspPayloads.forEach { put(it.second) } })
                 }
 
-                val bulkOk = sheetsService.backupAll(url, getAuthorityPassword(), bulkJson)
+                val bulkOk = sheetsService.backupAll(url, getSheetSyncKey(), bulkJson)
                 val totalBulkItems = kasPayloads.size + pgrPayloads.size + undPayloads.size + galCombinedPayloads.size + aspPayloads.size
 
                 if (bulkOk) {
@@ -1468,17 +2130,17 @@ class WargaRepository(private val context: Context) {
             val totalItems = kasPayloads.size + pgrPayloads.size + undPayloads.size + galTargetPayloads.size + aspPayloads.size
             var successCount = 0
             for ((id, json) in kasPayloads) {
-                if (sheetsService.sendAction(url, "edit", "Kas_RT", getAuthorityPassword(), json, id)) successCount++
+                if (sheetsService.sendAction(url, "edit", "Kas_RT", getSheetSyncKey(), json, id)) successCount++
             }
             for ((id, json) in pgrPayloads) {
-                if (sheetsService.sendAction(url, "edit", "Pengurus", getAuthorityPassword(), json, id)) successCount++
+                if (sheetsService.sendAction(url, "edit", "Pengurus", getSheetSyncKey(), json, id)) successCount++
             }
             for ((id, json) in undPayloads) {
-                if (sheetsService.sendAction(url, "edit", "Undangan", getAuthorityPassword(), json, id)) successCount++
+                if (sheetsService.sendAction(url, "edit", "Undangan", getSheetSyncKey(), json, id)) successCount++
             }
             galTargetPayloads.forEachIndexed { idx, (rowId, json) ->
                 if (idx > 0) delay(120)
-                if (sheetsService.sendAction(url, "edit", "Galeri", getAuthorityPassword(), json, rowId)) {
+                if (sheetsService.sendAction(url, "edit", "Galeri", getSheetSyncKey(), json, rowId)) {
                     val baseId = com.example.util.GaleriMultiPhotoHelper.baseGaleriId(rowId)
                     localUnsyncedGaleriIds.remove(baseId)
                     val formulaUrl = com.example.util.PhotoStorageHelper.extractUrlFromFormula(json.optString("foto", ""))
@@ -1489,7 +2151,7 @@ class WargaRepository(private val context: Context) {
                 }
             }
             for ((id, json) in aspPayloads) {
-                if (sheetsService.sendAction(url, "edit", "Aspirasi", getAuthorityPassword(), json, id)) successCount++
+                if (sheetsService.sendAction(url, "edit", "Aspirasi", getSheetSyncKey(), json, id)) successCount++
             }
 
             if (successCount > 0 || totalItems == 0) {
@@ -1579,6 +2241,11 @@ class WargaRepository(private val context: Context) {
                     put("status", item.status)
                     put("tanggapanPengurus", item.tanggapanPengurus)
                     put("fotoPengerjaan", item.fotoPengerjaan)
+                    put("penanggapNama", item.penanggapNama)
+                    put("penanggapUsername", item.penanggapUsername)
+                    put("penanggapNamaAsli", item.penanggapNamaAsli)
+                    put("penanggapPeran", item.penanggapPeran)
+                    put("waktuTanggapan", item.waktuTanggapan)
                 })
             }
             editor.putString("cache_aspirasi", aspArr.toString())
@@ -1624,6 +2291,11 @@ class WargaRepository(private val context: Context) {
                     put("status", item.status)
                     put("tanggapanPengurus", item.tanggapanPengurus)
                     put("fotoPengerjaan", item.fotoPengerjaan)
+                    put("penanggapNama", item.penanggapNama)
+                    put("penanggapUsername", item.penanggapUsername)
+                    put("penanggapNamaAsli", item.penanggapNamaAsli)
+                    put("penanggapPeran", item.penanggapPeran)
+                    put("waktuTanggapan", item.waktuTanggapan)
                 })
             }
             prefs.edit().putString("cache_aspirasi", aspArr.toString()).apply()
@@ -1675,6 +2347,7 @@ class WargaRepository(private val context: Context) {
                     ))
                 }
                 _pengurusList.value = list
+                refreshActiveRoleDisplayName()
             }
 
             val undJson = prefs.getString("cache_undangan", null)
@@ -1742,18 +2415,52 @@ class WargaRepository(private val context: Context) {
                     if (nama.contains("Mulyadi") || nama.contains("Siti Fatimah") || nama.contains("Blok B")) {
                         continue
                     }
+                    val rawTanggapanCache = obj.optString("tanggapanPengurus", obj.optString("Tanggapan_pengurus", ""))
+                    val parsedCacheMeta = com.example.util.AspirasiReplyCodec.parseAndStrip(rawTanggapanCache)
+                    val cachedMasalah = AspirasiSheetColumns.splitPhotoSlots(
+                        obj.optString("fotoMasalah", "")
+                            .ifBlank {
+                                listOf(
+                                    obj.optString("Foto_Masalah_1", ""),
+                                    obj.optString("Foto_Masalah_2", ""),
+                                    obj.optString("Foto_Masalah_3", ""),
+                                    obj.optString("Foto_Masalah_4", ""),
+                                    obj.optString("Foto_Masalah_5", "")
+                                ).filter { it.isNotBlank() }.joinToString(",")
+                            }
+                    ).joinToString(",")
+                    val cachedPengerjaan = AspirasiSheetColumns.splitPhotoSlots(
+                        obj.optString("fotoPengerjaan", "")
+                            .ifBlank {
+                                listOf(
+                                    obj.optString("Foto_pengerjaan_1", ""),
+                                    obj.optString("Foto_pengerjaan_2", ""),
+                                    obj.optString("Foto_pengerjaan_3", ""),
+                                    obj.optString("Foto_pengerjaan_4", ""),
+                                    obj.optString("Foto_pengerjaan_5", "")
+                                ).filter { it.isNotBlank() }.joinToString(",")
+                            }
+                    ).joinToString(",")
                     list.add(AspirasiItem(
-                        id = obj.getString("id"),
-                        tanggal = obj.getString("tanggal"),
+                        id = obj.optString("id", obj.optString("ID", "")),
+                        tanggal = obj.optString("tanggal", obj.optString("Tanggal", "")),
                         nama = nama,
+                        kategori = obj.optString("kategori", obj.optString("Kategori", "Masukan/Saran")).ifBlank { "Masukan/Saran" },
+                        pesan = obj.optString("pesan", obj.optString("Pesan", "")),
+                        fotoMasalah = cachedMasalah,
+                        status = obj.optString("status", obj.optString("Status", "Menunggu")).ifBlank { "Menunggu" },
+                        penanggapNama = obj.optString("penanggapNama", obj.optString("Nama_Pengurus", ""))
+                            .ifBlank { parsedCacheMeta.penanggapNama },
+                        tanggapanPengurus = parsedCacheMeta.cleanTanggapan,
+                        fotoPengerjaan = cachedPengerjaan,
                         noRumah = obj.optString("noRumah", ""),
                         sembunyikanNama = obj.optBoolean("sembunyikanNama", false),
-                        kategori = obj.optString("kategori", "Masukan/Saran"),
-                        pesan = obj.getString("pesan"),
-                        fotoMasalah = obj.optString("fotoMasalah", ""),
-                        status = obj.optString("status", "Menunggu"),
-                        tanggapanPengurus = obj.optString("tanggapanPengurus", ""),
-                        fotoPengerjaan = obj.optString("fotoPengerjaan", "")
+                        penanggapUsername = obj.optString("penanggapUsername", ""),
+                        penanggapNamaAsli = obj.optString("penanggapNamaAsli", ""),
+                        penanggapPeran = obj.optString("penanggapPeran", "")
+                            .ifBlank { parsedCacheMeta.penanggapPeran },
+                        waktuTanggapan = obj.optString("waktuTanggapan", "")
+                            .ifBlank { parsedCacheMeta.waktuTanggapan }
                     ))
                 }
                 if (list.isNotEmpty()) {

@@ -65,11 +65,12 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MyApplicationTheme {
+                val splashDurationMs by viewModel.splashDurationMs.collectAsStateWithLifecycle()
                 var showSplash by rememberSaveable { mutableStateOf(true) }
 
                 LaunchedEffect(showSplash) {
                     if (showSplash) {
-                        delay(4000L)
+                        delay(splashDurationMs)
                         showSplash = false
                     }
                 }
@@ -117,6 +118,7 @@ class MainActivity : ComponentActivity() {
 fun MainContent(viewModel: WargaViewModel) {
     val currentTab by viewModel.currentTab.collectAsStateWithLifecycle()
     val userRole by viewModel.userRole.collectAsStateWithLifecycle()
+    val activeRoleDisplayName by viewModel.activeRoleDisplayName.collectAsStateWithLifecycle()
     val isSyncing by viewModel.isSyncing.collectAsStateWithLifecycle()
     val syncMessage by viewModel.syncMessage.collectAsStateWithLifecycle()
     val needsScriptUpdate by viewModel.needsScriptUpdate.collectAsStateWithLifecycle()
@@ -151,6 +153,11 @@ fun MainContent(viewModel: WargaViewModel) {
     val showConfigDialog by viewModel.showConfigDialog.collectAsStateWithLifecycle()
     val showChangePasswordDialog by viewModel.showChangePasswordDialog.collectAsStateWithLifecycle()
     val changePasswordError by viewModel.changePasswordError.collectAsStateWithLifecycle()
+    val showPengurusAccountsDialog by viewModel.showPengurusAccountsDialog.collectAsStateWithLifecycle()
+    val pengurusAccounts by viewModel.pengurusAccounts.collectAsStateWithLifecycle()
+    val showSplashSettingsDialog by viewModel.showSplashSettingsDialog.collectAsStateWithLifecycle()
+    val splashDurationMs by viewModel.splashDurationMs.collectAsStateWithLifecycle()
+    val showNotificationToneDialog by viewModel.showNotificationToneDialog.collectAsStateWithLifecycle()
 
     val showAddKasDialog by viewModel.showAddKasDialog.collectAsStateWithLifecycle()
     val editingKasItem by viewModel.editingKasItem.collectAsStateWithLifecycle()
@@ -174,6 +181,7 @@ fun MainContent(viewModel: WargaViewModel) {
     val snackbarMessage by viewModel.snackbarMessage.collectAsStateWithLifecycle()
     val photoUploadWarning by viewModel.photoUploadWarning.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
+    var showLogoutDialog by remember { mutableStateOf(false) }
 
     // Request notification runtime permission on Android 13+ (API 33)
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -230,18 +238,22 @@ fun MainContent(viewModel: WargaViewModel) {
                 userRole = userRole,
                 isSyncing = isSyncing,
                 unreadNotificationCount = unreadNotifications,
+                roleDisplayName = activeRoleDisplayName,
                 onRoleClick = {
                     if (userRole == UserRole.WARGA) {
-                        viewModel.requireAuthority { /* Role is updated to PENGURUS */ }
+                        viewModel.requireAuthority { /* Role is updated via password */ }
                     } else {
-                        viewModel.lockToWargaMode()
+                        showLogoutDialog = true
                     }
                 },
                 onRefreshClick = { viewModel.triggerRefresh() },
                 onNotificationClick = { viewModel.openNotificationDialog() },
                 onOpenSettings = { viewModel.openConfigDialog() },
                 onOpenChangePassword = { viewModel.openChangePasswordDialog() },
-                onOpenReminderMode = { viewModel.openEventReminderDialog() }
+                onOpenReminderMode = { viewModel.openEventReminderDialog() },
+                onOpenPengurusAccounts = { viewModel.openPengurusAccountsDialog() },
+                onOpenSplashSettings = { viewModel.openSplashSettingsDialog() },
+                onOpenNotificationTone = { viewModel.openNotificationToneDialog() }
             )
         },
         bottomBar = {
@@ -401,6 +413,7 @@ fun MainContent(viewModel: WargaViewModel) {
                 4 -> AspirasiScreen(
                     aspirasiList = aspirasiList,
                     userRole = userRole,
+                    pengurusAccounts = pengurusAccounts,
                     sheetUrl = sheetUrl,
                     onOpenConfigDialog = { viewModel.openConfigDialog() },
                     onOpenSubmitAspirasi = { viewModel.openAspirasiDialog() },
@@ -430,7 +443,22 @@ fun MainContent(viewModel: WargaViewModel) {
         AuthorityPasswordDialog(
             errorMessage = authorityError,
             onDismiss = { viewModel.dismissAuthorityDialog() },
-            onSubmit = { enteredPassword -> viewModel.verifyPassword(enteredPassword) }
+            onSubmit = { enteredUsername, enteredPassword ->
+                viewModel.verifyPassword(enteredUsername, enteredPassword)
+            }
+        )
+    }
+
+    // Logout Confirmation Dialog for Pengurus / Admin
+    if (showLogoutDialog && userRole != UserRole.WARGA) {
+        LogoutAuthorityDialog(
+            currentRole = userRole,
+            activeDisplayName = activeRoleDisplayName,
+            onDismiss = { showLogoutDialog = false },
+            onConfirmLogout = {
+                showLogoutDialog = false
+                viewModel.lockToWargaMode()
+            }
         )
     }
 
@@ -440,6 +468,20 @@ fun MainContent(viewModel: WargaViewModel) {
             notifications = notifications,
             onDismiss = { viewModel.dismissNotificationDialog() },
             onClearAll = { NotificationHelper.clearNotifications() }
+        )
+    }
+
+    // Per-device Notification Tone Picker Dialog (Accessible across Warga, Pengurus, and Admin)
+    if (showNotificationToneDialog) {
+        val initialTonePref = remember(showNotificationToneDialog) {
+            com.example.util.NotificationToneManager.getPreference(context)
+        }
+        NotificationToneDialog(
+            initialPreference = initialTonePref,
+            onDismiss = { viewModel.dismissNotificationToneDialog() },
+            onSave = { option, customUri, customTitle ->
+                viewModel.saveNotificationTone(option, customUri, customTitle)
+            }
         )
     }
 
@@ -454,14 +496,34 @@ fun MainContent(viewModel: WargaViewModel) {
         )
     }
 
-    // Change Authority Password Dialog (Wajib Password Khusus Amm080309)
-    if (showChangePasswordDialog) {
+    // Change Authority Password Dialog (Khusus Admin Induk)
+    if (showChangePasswordDialog && userRole == UserRole.ADMIN_UTAMA) {
         ChangePasswordDialog(
             errorMessage = changePasswordError,
             onVerifyMasterPassword = { masterPass -> viewModel.verifyMasterPasswordForChange(masterPass) },
             onClearError = { viewModel.clearChangePasswordError() },
             onDismiss = { viewModel.closeChangePasswordDialog() },
             onSubmit = { masterPass, newPass -> viewModel.changePassword(masterPass, newPass) }
+        )
+    }
+
+    // Pengurus Accounts Management Dialog (Khusus Admin Induk)
+    if (showPengurusAccountsDialog && userRole == UserRole.ADMIN_UTAMA) {
+        PengurusAccountsDialog(
+            accounts = pengurusAccounts,
+            onDismiss = { viewModel.dismissPengurusAccountsDialog() },
+            onSaveAccount = { account -> viewModel.savePengurusAccount(account) },
+            onToggleActive = { id, aktif -> viewModel.togglePengurusAccountActive(id, aktif) },
+            onDeleteAccount = { id -> viewModel.deletePengurusAccount(id) }
+        )
+    }
+
+    // Splash Screen Duration Dialog (Khusus Admin Induk)
+    if (showSplashSettingsDialog && userRole == UserRole.ADMIN_UTAMA) {
+        SplashDurationDialog(
+            currentDurationMs = splashDurationMs,
+            onDismiss = { viewModel.dismissSplashSettingsDialog() },
+            onSaveSeconds = { seconds -> viewModel.updateSplashDurationSeconds(seconds) }
         )
     }
 
@@ -529,13 +591,15 @@ fun MainContent(viewModel: WargaViewModel) {
     if (showRespondAspirasiDialog && selectedAspirasiForResponse != null) {
         TanggapanAspirasiDialog(
             item = selectedAspirasiForResponse!!,
+            userRole = userRole,
             onDismiss = { viewModel.dismissRespondAspirasiDialog() },
-            onSubmit = { status, tanggapan, fotoPengerjaan ->
+            onSubmit = { status, tanggapan, fotoPengerjaan, namaPenanggap ->
                 viewModel.saveTanggapanAspirasi(
                     selectedAspirasiForResponse!!.id,
                     status,
                     tanggapan,
-                    fotoPengerjaan
+                    fotoPengerjaan,
+                    namaPenanggap
                 )
             }
         )

@@ -28,6 +28,7 @@ import com.example.data.model.ReminderMode
 import com.example.data.model.UndanganItem
 import com.example.data.model.UserRole
 import com.example.ui.theme.*
+import com.example.util.IndonesianDateHelper
 import com.example.util.ReminderCalculator
 import kotlinx.coroutines.delay
 
@@ -142,9 +143,10 @@ fun ActiveRemindersSection(
 
                     Spacer(modifier = Modifier.height(4.dp))
 
+                    val formattedTanggal = remember(item.tanggal) { IndonesianDateHelper.formatFullDate(item.tanggal) }
                     val locationSuffix = if (item.lokasi.isNotBlank() && item.lokasi != "-") " • ${item.lokasi}" else ""
                     Text(
-                        text = "Jadwal: ${item.tanggal} (${item.waktu})$locationSuffix",
+                        text = "Jadwal: $formattedTanggal (${item.waktu})$locationSuffix",
                         fontSize = 12.sp,
                         color = TextSecondary
                     )
@@ -432,8 +434,11 @@ fun EventReminderDialog(
                                             }
                                         }
                                         Spacer(modifier = Modifier.height(2.dp))
+                                        val formattedEventDate = remember(event.tanggal) {
+                                            IndonesianDateHelper.formatFullDate(event.tanggal)
+                                        }
                                         Text(
-                                            text = "${event.tanggal} • ${event.waktu} • ${event.lokasi.ifBlank { "Lingkungan RT 005" }}",
+                                            text = "$formattedEventDate • ${event.waktu} • ${event.lokasi.ifBlank { "Lingkungan RT 005" }}",
                                             fontSize = 11.sp,
                                             color = TextSecondary,
                                             maxLines = 1,

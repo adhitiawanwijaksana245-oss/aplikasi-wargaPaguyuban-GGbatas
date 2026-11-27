@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.example.data.model.*
 import com.example.ui.theme.NavyPrimary
+import com.example.util.IndonesianDateHelper
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -292,11 +293,14 @@ fun AspirasiDialog(
 @Composable
 fun TanggapanAspirasiDialog(
     item: AspirasiItem,
+    userRole: UserRole = UserRole.WARGA,
     onDismiss: () -> Unit,
-    onSubmit: (status: String, tanggapan: String, fotoPengerjaan: String) -> Unit
+    onSubmit: (status: String, tanggapan: String, fotoPengerjaan: String, namaPenanggap: String) -> Unit
 ) {
     var status by remember { mutableStateOf(if (item.status.isBlank()) "Menunggu" else item.status) }
     var tanggapan by remember { mutableStateOf(item.tanggapanPengurus) }
+    var namaPenanggap by remember { mutableStateOf(item.penanggapNama) }
+    var showNameError by remember { mutableStateOf(false) }
     var fotoPengerjaanList by remember {
         mutableStateOf(
             item.fotoPengerjaan.split(",")
@@ -307,6 +311,12 @@ fun TanggapanAspirasiDialog(
     }
 
     val statusOptions = listOf("Menunggu", "Diproses", "Selesai")
+    val showRealSender = !item.sembunyikanNama || userRole == UserRole.ADMIN_UTAMA
+    val senderLabel = if (showRealSender) {
+        item.nama + if (item.noRumah.isNotBlank()) " (Rumah: ${item.noRumah})" else ""
+    } else {
+        "Warga Disamarkan"
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -318,14 +328,18 @@ fun TanggapanAspirasiDialog(
                     .verticalScroll(rememberScrollState())
             ) {
                 Text(
-                    text = "Aspirasi dari: ${item.nama}" + if (item.noRumah.isNotBlank()) " (Rumah: ${item.noRumah})" else "",
+                    text = "Aspirasi dari: $senderLabel",
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.primary
                 )
                 if (item.sembunyikanNama) {
                     Text(
-                        text = "🔒 Pengirim memilih menyamarkan nama untuk warga lain",
+                        text = if (userRole == UserRole.ADMIN_UTAMA) {
+                            "🔒 Pengirim memilih menyamarkan nama (terlihat khusus mode Admin)"
+                        } else {
+                            "🔒 Pengirim memilih menyamarkan identitas"
+                        },
                         fontSize = 11.sp,
                         color = Color(0xFFD97706)
                     )
@@ -364,6 +378,38 @@ fun TanggapanAspirasiDialog(
                     modifier = Modifier.fillMaxWidth().testTag("tanggapan_input")
                 )
 
+                Spacer(modifier = Modifier.height(12.dp))
+                val roleBadgeLabel = if (userRole == UserRole.ADMIN_UTAMA) "Admin" else "Pengurus"
+                OutlinedTextField(
+                    value = namaPenanggap,
+                    onValueChange = {
+                        namaPenanggap = it
+                        if (it.isNotBlank()) showNameError = false
+                    },
+                    label = { Text("Nama Penanggap *") },
+                    placeholder = { Text("Wajib isi nama Anda / nama samaran") },
+                    singleLine = true,
+                    isError = showNameError || namaPenanggap.isBlank(),
+                    supportingText = {
+                        if (showNameError && namaPenanggap.isBlank()) {
+                            Text(
+                                text = "Nama penanggap wajib diisi sebelum menyimpan",
+                                color = MaterialTheme.colorScheme.error,
+                                fontSize = 11.sp
+                            )
+                        } else {
+                            Text(
+                                text = "Wajib diisi • Peran tercatat sebagai $roleBadgeLabel (bisa nama asli atau samaran)",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("tanggapan_nama_input")
+                )
+
                 Spacer(modifier = Modifier.height(14.dp))
                 MultiPhotoPickerSection(
                     label = "Foto Bukti Pengerjaan (Kamera / Galeri - Maks. 5 Foto)",
@@ -375,7 +421,14 @@ fun TanggapanAspirasiDialog(
         },
         confirmButton = {
             Button(
-                onClick = { onSubmit(status, tanggapan, fotoPengerjaanList.joinToString(",")) },
+                onClick = {
+                    if (namaPenanggap.isBlank()) {
+                        showNameError = true
+                    } else {
+                        onSubmit(status, tanggapan, fotoPengerjaanList.joinToString(","), namaPenanggap.trim())
+                    }
+                },
+                enabled = namaPenanggap.isNotBlank() && tanggapan.isNotBlank(),
                 modifier = Modifier.testTag("save_tanggapan_button")
             ) {
                 Text("Simpan Tanggapan")
@@ -399,7 +452,11 @@ fun KasTransactionDialog(
         SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
     }
 
-    var tanggal by remember { mutableStateOf(item?.tanggal ?: todayDate) }
+    var tanggal by remember {
+        mutableStateOf(
+            item?.tanggal?.takeIf { it.isNotBlank() }?.let { IndonesianDateHelper.toIsoDate(it) } ?: todayDate
+        )
+    }
     var kategori by remember { mutableStateOf(item?.kategori ?: "") }
     var keterangan by remember { mutableStateOf(item?.keterangan ?: "") }
     var isMasuk by remember { mutableStateOf((item?.masuk ?: 0L) > 0L || (item == null)) }
@@ -566,7 +623,11 @@ fun UndanganDialog(
 
     var isPengumuman by remember { mutableStateOf(item?.isPengumuman ?: false) }
     var rawJudul by remember { mutableStateOf(item?.cleanJudul ?: "") }
-    var tanggal by remember { mutableStateOf(item?.tanggal ?: todayDate) }
+    var tanggal by remember {
+        mutableStateOf(
+            item?.tanggal?.takeIf { it.isNotBlank() }?.let { IndonesianDateHelper.toIsoDate(it) } ?: todayDate
+        )
+    }
     var waktu by remember { mutableStateOf(item?.waktu ?: if (isPengumuman) "-" else "19:30 WIB") }
     var lokasi by remember { mutableStateOf(item?.lokasi ?: if (isPengumuman) "Lingkungan RT 005" else "") }
     var keterangan by remember { mutableStateOf(item?.cleanKeterangan ?: "") }
@@ -878,7 +939,11 @@ fun GaleriDialog(
     }
 
     var judul by remember(item) { mutableStateOf(item?.judul ?: "") }
-    var tanggal by remember(item) { mutableStateOf(item?.tanggal?.ifBlank { todayDate } ?: todayDate) }
+    var tanggal by remember(item) {
+        mutableStateOf(
+            item?.tanggal?.takeIf { it.isNotBlank() }?.let { IndonesianDateHelper.toIsoDate(it) } ?: todayDate
+        )
+    }
     var keterangan by remember(item) { mutableStateOf(item?.keterangan ?: "") }
     var photoList by remember(item) { mutableStateOf(initialPhotos) }
     var petugas by remember(item) { mutableStateOf(item?.petugas ?: "") }

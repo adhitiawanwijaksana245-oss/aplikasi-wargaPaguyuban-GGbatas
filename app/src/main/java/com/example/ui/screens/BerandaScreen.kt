@@ -33,6 +33,7 @@ import com.example.ui.components.FullScreenPhotoState
 import com.example.ui.components.FullScreenPhotoViewerDialog
 import com.example.ui.theme.*
 import com.example.ui.viewmodel.WargaViewModel
+import com.example.util.IndonesianDateHelper
 import com.example.util.PhotoStorageHelper
 
 @Composable
@@ -557,8 +558,11 @@ fun BerandaScreen(
                                 }
                             }
 
+                            val formattedPengumumanDate = remember(latestPengumuman.tanggal) {
+                                IndonesianDateHelper.formatFullDate(latestPengumuman.tanggal)
+                            }
                             Text(
-                                text = latestPengumuman.tanggal,
+                                text = formattedPengumumanDate,
                                 fontSize = 11.sp,
                                 color = TextMuted
                             )
@@ -588,7 +592,7 @@ fun BerandaScreen(
                                     .clickable {
                                         fullScreenPhotoState = FullScreenPhotoState(
                                             title = latestPengumuman.cleanJudul,
-                                            tanggal = latestPengumuman.tanggal,
+                                            tanggal = IndonesianDateHelper.formatFullDate(latestPengumuman.tanggal),
                                             photos = listOf(latestPengumuman.foto),
                                             initialIndex = 0
                                         )

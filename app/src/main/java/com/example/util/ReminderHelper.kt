@@ -66,8 +66,13 @@ object ReminderCalculator {
         waktu: String,
         timeZone: TimeZone = TimeZone.getTimeZone("Asia/Jakarta")
     ): Long? {
-        val cleanDate = tanggal.trim()
-        if (cleanDate.isBlank()) return null
+        val rawDate = tanggal.trim()
+        if (rawDate.isBlank()) return null
+        val cleanDate = if (rawDate.contains("T")) {
+            IndonesianDateHelper.toIsoDate(rawDate).ifBlank { rawDate }
+        } else {
+            rawDate
+        }
 
         var parsedDate: Date? = null
         for (pattern in DATE_PATTERNS) {
@@ -150,7 +155,8 @@ object ReminderCalculator {
 
     fun buildReminderNotificationMessage(item: UndanganItem): String {
         val locationPart = if (item.lokasi.isNotBlank() && item.lokasi != "-") " di ${item.lokasi}" else ""
-        val schedulePart = if (item.waktu.isNotBlank() && item.waktu != "-") "${item.tanggal} pukul ${item.waktu}" else item.tanggal
+        val formattedDate = IndonesianDateHelper.formatFullDate(item.tanggal)
+        val schedulePart = if (item.waktu.isNotBlank() && item.waktu != "-") "$formattedDate pukul ${item.waktu}" else formattedDate
         val notes = item.cleanKeterangan
         return buildString {
             append("Pengingat acara warga (${item.effectiveReminderMenit} menit): ")

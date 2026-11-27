@@ -28,4 +28,12 @@ interface AspirasiDao {
 
     @Query("DELETE FROM aspirasi")
     suspend fun clearAllAspirasi()
+
+    @Transaction
+    suspend fun replaceAllAspirasi(items: List<AspirasiEntity>) {
+        clearAllAspirasi()
+        if (items.isNotEmpty()) {
+            insertAspirasiList(items)
+        }
+    }
 }

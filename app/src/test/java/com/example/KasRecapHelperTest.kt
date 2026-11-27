@@ -2,6 +2,7 @@ package com.example
 
 import com.example.data.model.KasItem
 import com.example.data.model.KasMonthlyRecap
+import com.example.data.model.KasSummaryTotals
 import com.example.util.KasRecapHelper
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -124,5 +125,64 @@ class KasRecapHelperTest {
         assertEquals("2030-12", timeline.last().periodeBulan)
         assertEquals("Desember 2030", timeline.last().labelBulan)
         assertEquals(1_300_000L, timeline.last().saldoAkhir)
+    }
+
+    @Test
+    fun parseMonthKey_convertsUtcEndOfMonthIsoToWibNextMonth() {
+        assertEquals("2026-12", KasRecapHelper.parseMonthKey("2026-11-30T17:00:00.000Z"))
+        assertEquals("2026-01", KasRecapHelper.parseMonthKey("2025-12-31T17:00:00.000Z"))
+    }
+
+    @Test
+    fun buildAvailableMonthKeys_ordersDesember2025ToDesember2030Chronologically() {
+        val keys = KasRecapHelper.buildAvailableMonthKeys(
+            kasList = emptyList(),
+            rekapBulanan = emptyList()
+        )
+        assertEquals("Semua", keys.first())
+        assertEquals("2025-12", keys[1])
+        assertEquals("2026-01", keys[2])
+        assertEquals("2030-12", keys.last())
+        assertEquals(62, keys.size)
+    }
+
+    @Test
+    fun computePeriodSummary_calculatesSaldoAwalAndSemuaPeriodeCorrectly() {
+        val kasList = listOf(
+            KasItem(id = "K-DEC", tanggal = "2025-12-10", masuk = 500_000L, keluar = 100_000L),
+            KasItem(id = "K-JAN", tanggal = "2026-01-15", masuk = 300_000L, keluar = 50_000L),
+            KasItem(id = "K-MAR", tanggal = "2026-03-05", masuk = 0L, keluar = 150_000L)
+        )
+        val overall = KasRecapHelper.computeUnifiedSummary(kasList, emptyList())
+
+        val allPeriod = KasRecapHelper.computePeriodSummary("Semua", kasList, emptyList(), overall)
+        assertEquals(0L, allPeriod.saldoAwal)
+        assertEquals(800_000L, allPeriod.totalMasuk)
+        assertEquals(300_000L, allPeriod.totalKeluar)
+        assertEquals(500_000L, allPeriod.saldoAkhir)
+
+        val decSummary = KasRecapHelper.computePeriodSummary("2025-12", kasList, emptyList(), overall)
+        assertEquals(0L, decSummary.saldoAwal)
+        assertEquals(500_000L, decSummary.totalMasuk)
+        assertEquals(100_000L, decSummary.totalKeluar)
+        assertEquals(400_000L, decSummary.saldoAkhir)
+
+        val janSummary = KasRecapHelper.computePeriodSummary("2026-01", kasList, emptyList(), overall)
+        assertEquals(400_000L, janSummary.saldoAwal)
+        assertEquals(300_000L, janSummary.totalMasuk)
+        assertEquals(50_000L, janSummary.totalKeluar)
+        assertEquals(650_000L, janSummary.saldoAkhir)
+
+        val febSummary = KasRecapHelper.computePeriodSummary("2026-02", kasList, emptyList(), overall)
+        assertEquals(650_000L, febSummary.saldoAwal)
+        assertEquals(0L, febSummary.totalMasuk)
+        assertEquals(0L, febSummary.totalKeluar)
+        assertEquals(650_000L, febSummary.saldoAkhir)
+
+        val marSummary = KasRecapHelper.computePeriodSummary("2026-03", kasList, emptyList(), overall)
+        assertEquals(650_000L, marSummary.saldoAwal)
+        assertEquals(0L, marSummary.totalMasuk)
+        assertEquals(150_000L, marSummary.totalKeluar)
+        assertEquals(500_000L, marSummary.saldoAkhir)
     }
 }

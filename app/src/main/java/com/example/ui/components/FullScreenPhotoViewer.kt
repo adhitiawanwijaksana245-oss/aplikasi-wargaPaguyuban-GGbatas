@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import coil.compose.SubcomposeAsyncImage
+import com.example.util.IndonesianDateHelper
 import com.example.util.PhotoStorageHelper
 
 data class FullScreenPhotoState(
@@ -237,9 +238,12 @@ fun FullScreenPhotoViewerDialog(
                     }
                 }
                 if (state.tanggal.isNotBlank()) {
+                    val formattedTanggal = remember(state.tanggal) {
+                        IndonesianDateHelper.formatFullDate(state.tanggal)
+                    }
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = state.tanggal,
+                        text = formattedTanggal,
                         color = Color.White.copy(alpha = 0.8f),
                         fontSize = 12.sp
                     )

@@ -120,6 +120,11 @@ class BackgroundSyncWorker(
                     put("status", item.status)
                     put("tanggapanPengurus", item.tanggapanPengurus)
                     put("fotoPengerjaan", item.fotoPengerjaan)
+                    put("penanggapNama", item.penanggapNama)
+                    put("penanggapUsername", item.penanggapUsername)
+                    put("penanggapNamaAsli", item.penanggapNamaAsli)
+                    put("penanggapPeran", item.penanggapPeran)
+                    put("waktuTanggapan", item.waktuTanggapan)
                 })
             }
             prefs.edit().putString("cache_aspirasi", arr.toString()).apply()

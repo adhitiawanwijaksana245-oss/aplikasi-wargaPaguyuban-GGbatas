@@ -30,6 +30,7 @@ import com.example.ui.components.ActiveRemindersSection
 import com.example.ui.components.FullScreenPhotoState
 import com.example.ui.components.FullScreenPhotoViewerDialog
 import com.example.ui.theme.*
+import com.example.util.IndonesianDateHelper
 import com.example.util.PhotoStorageHelper
 
 @Composable
@@ -213,6 +214,9 @@ fun UndanganScreen(
             } else {
                 items(filteredList) { item ->
                     val isPengumuman = item.isPengumuman
+                    val formattedTanggal = remember(item.tanggal) {
+                        IndonesianDateHelper.formatFullDate(item.tanggal)
+                    }
 
                     Card(
                         shape = RoundedCornerShape(16.dp),
@@ -229,7 +233,8 @@ fun UndanganScreen(
                             ) {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.weight(1f)
                                 ) {
                                     // Type Badge (Pengumuman vs Undangan)
                                     Surface(
@@ -259,9 +264,9 @@ fun UndanganScreen(
                                     // Date
                                     Text(
                                         text = if (isPengumuman || item.waktu == "-" || item.waktu.isBlank()) {
-                                            item.tanggal
+                                            formattedTanggal
                                         } else {
-                                            "${item.tanggal} • ${item.waktu}"
+                                            "$formattedTanggal • ${item.waktu}"
                                         },
                                         fontSize = 11.sp,
                                         color = TextSecondary
@@ -275,7 +280,7 @@ fun UndanganScreen(
                                             """
 📢 *PENGUMUMAN RESMI PAGUYUBAN WARGA RT 005 / RW 011 MULYAHARJA*
 Judul: *${item.cleanJudul}*
-📅 Tanggal: ${item.tanggal}
+📅 Tanggal: $formattedTanggal
 
 Isi Pengumuman:
 ${item.cleanKeterangan}
@@ -286,7 +291,7 @@ _Salam Pengurus RT 005 Mulyaharja._
                                             """
 🗓️ *UNDANGAN KEGIATAN WARGA RT 005 / RW 011 MULYAHARJA*
 Acara: *${item.cleanJudul}*
-📅 Tanggal: ${item.tanggal}
+📅 Tanggal: $formattedTanggal
 ⏰ Waktu: ${item.waktu}
 📍 Lokasi: ${item.lokasi}
 
@@ -349,7 +354,7 @@ _Mohon kehadirannya tepat waktu. Salam Warga RT 005._
                                         .clickable {
                                             fullScreenPhotoState = FullScreenPhotoState(
                                                 title = item.cleanJudul,
-                                                tanggal = if (isPengumuman || item.waktu == "-" || item.waktu.isBlank()) item.tanggal else "${item.tanggal} • ${item.waktu}",
+                                                tanggal = if (isPengumuman || item.waktu == "-" || item.waktu.isBlank()) formattedTanggal else "$formattedTanggal • ${item.waktu}",
                                                 photos = listOf(item.foto),
                                                 initialIndex = 0
                                             )
@@ -454,8 +459,10 @@ _Mohon kehadirannya tepat waktu. Salam Warga RT 005._
                                     IconButton(onClick = { onEditUndanganClick(item) }, modifier = Modifier.size(48.dp)) {
                                         Icon(Icons.Outlined.Edit, contentDescription = "Edit", tint = AccentBlue, modifier = Modifier.size(18.dp))
                                     }
-                                    IconButton(onClick = { onDeleteUndanganClick(item.id) }, modifier = Modifier.size(48.dp)) {
-                                        Icon(Icons.Outlined.Delete, contentDescription = "Hapus", tint = RedExpense, modifier = Modifier.size(18.dp))
+                                    if (userRole == UserRole.ADMIN_UTAMA) {
+                                        IconButton(onClick = { onDeleteUndanganClick(item.id) }, modifier = Modifier.size(48.dp)) {
+                                            Icon(Icons.Outlined.Delete, contentDescription = "Hapus", tint = RedExpense, modifier = Modifier.size(18.dp))
+                                        }
                                     }
                                 }
                             }
@@ -469,18 +476,20 @@ _Mohon kehadirannya tepat waktu. Salam Warga RT 005._
             }
         }
 
-        // FAB to Add Announcement or Invitation
-        FloatingActionButton(
-            onClick = onAddUndanganClick,
-            containerColor = NavyPrimary,
-            contentColor = Color.White,
-            shape = CircleShape,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp)
-                .testTag("add_undangan_fab")
-        ) {
-            Icon(Icons.Filled.Add, contentDescription = "Tambah Pengumuman atau Undangan")
+        // FAB to Add Announcement or Invitation (Hidden in Warga mode)
+        if (userRole != UserRole.WARGA) {
+            FloatingActionButton(
+                onClick = onAddUndanganClick,
+                containerColor = NavyPrimary,
+                contentColor = Color.White,
+                shape = CircleShape,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(20.dp)
+                    .testTag("add_undangan_fab")
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = "Tambah Pengumuman atau Undangan")
+            }
         }
 
         fullScreenPhotoState?.let { state ->

@@ -29,6 +29,7 @@ import com.example.data.model.UserRole
 import com.example.ui.components.FullScreenPhotoState
 import com.example.ui.components.FullScreenPhotoViewerDialog
 import com.example.ui.theme.*
+import com.example.util.IndonesianDateHelper
 
 @Composable
 fun GaleriScreen(
@@ -169,6 +170,12 @@ fun GaleriScreen(
                             .map { it.trim() }
                             .filter { it.isNotBlank() && com.example.util.PhotoStorageHelper.getDisplayModel(it) != "" }
                     }
+                    val formattedFullDate = remember(item.tanggal) {
+                        IndonesianDateHelper.formatFullDate(item.tanggal)
+                    }
+                    val formattedShortDate = remember(item.tanggal) {
+                        IndonesianDateHelper.formatShortDate(item.tanggal)
+                    }
 
                     Card(
                         shape = RoundedCornerShape(16.dp),
@@ -200,7 +207,7 @@ fun GaleriScreen(
                                                     .clickable {
                                                         fullScreenState = FullScreenPhotoState(
                                                             title = item.judul,
-                                                            tanggal = item.tanggal,
+                                                            tanggal = formattedFullDate,
                                                             photos = photos,
                                                             initialIndex = idx
                                                         )
@@ -294,7 +301,7 @@ fun GaleriScreen(
                                         .clickable {
                                             fullScreenState = FullScreenPhotoState(
                                                 title = item.judul,
-                                                tanggal = item.tanggal,
+                                                tanggal = formattedFullDate,
                                                 photos = photos,
                                                 initialIndex = 0
                                             )
@@ -370,8 +377,9 @@ fun GaleriScreen(
                                         color = TextPrimary,
                                         modifier = Modifier.weight(1f)
                                     )
+                                    Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = item.tanggal,
+                                        text = formattedShortDate,
                                         fontSize = 11.sp,
                                         color = TextMuted
                                     )
@@ -455,18 +463,20 @@ fun GaleriScreen(
                                                     modifier = Modifier.size(18.dp)
                                                 )
                                             }
-                                            IconButton(
-                                                onClick = { onDeleteGaleriClick(item.id) },
-                                                modifier = Modifier
-                                                    .size(48.dp)
-                                                    .testTag("delete_galeri_${item.id}")
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Outlined.Delete,
-                                                    contentDescription = "Hapus",
-                                                    tint = RedExpense,
-                                                    modifier = Modifier.size(18.dp)
-                                                )
+                                            if (userRole == UserRole.ADMIN_UTAMA) {
+                                                IconButton(
+                                                    onClick = { onDeleteGaleriClick(item.id) },
+                                                    modifier = Modifier
+                                                        .size(48.dp)
+                                                        .testTag("delete_galeri_${item.id}")
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Outlined.Delete,
+                                                        contentDescription = "Hapus",
+                                                        tint = RedExpense,
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -482,18 +492,20 @@ fun GaleriScreen(
             }
         }
 
-        // FAB to Add Gallery Photo
-        FloatingActionButton(
-            onClick = onAddGaleriClick,
-            containerColor = NavyPrimary,
-            contentColor = Color.White,
-            shape = CircleShape,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp)
-                .testTag("add_galeri_fab")
-        ) {
-            Icon(Icons.Filled.AddAPhoto, contentDescription = "Tambah Foto")
+        // FAB to Add Gallery Photo (Hidden in Warga mode)
+        if (userRole != UserRole.WARGA) {
+            FloatingActionButton(
+                onClick = onAddGaleriClick,
+                containerColor = NavyPrimary,
+                contentColor = Color.White,
+                shape = CircleShape,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(20.dp)
+                    .testTag("add_galeri_fab")
+            ) {
+                Icon(Icons.Filled.AddAPhoto, contentDescription = "Tambah Foto")
+            }
         }
     }
 

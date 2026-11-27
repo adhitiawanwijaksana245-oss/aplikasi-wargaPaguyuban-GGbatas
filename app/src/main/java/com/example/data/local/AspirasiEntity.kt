@@ -3,6 +3,8 @@ package com.example.data.local
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import com.example.data.model.AspirasiItem
+import com.example.data.model.AspirasiSheetColumns
+import com.example.util.AspirasiReplyCodec
 
 @Entity(tableName = "aspirasi")
 data class AspirasiEntity(
@@ -17,22 +19,35 @@ data class AspirasiEntity(
     val status: String = "Menunggu",
     val tanggapanPengurus: String = "",
     val fotoPengerjaan: String = "",
+    val penanggapNama: String = "",
+    val penanggapUsername: String = "",
+    val penanggapNamaAsli: String = "",
+    val penanggapPeran: String = "",
+    val waktuTanggapan: String = "",
     val lastModified: Long = System.currentTimeMillis(),
     val syncStatus: String = SYNC_STATUS_SYNCED
 ) {
-    fun toAspirasiItem(): AspirasiItem = AspirasiItem(
-        id = id,
-        tanggal = tanggal,
-        nama = nama,
-        noRumah = noRumah,
-        sembunyikanNama = sembunyikanNama,
-        kategori = kategori,
-        pesan = pesan,
-        fotoMasalah = fotoMasalah,
-        status = status,
-        tanggapanPengurus = tanggapanPengurus,
-        fotoPengerjaan = fotoPengerjaan
-    )
+    fun toAspirasiItem(): AspirasiItem {
+        val parsedMeta = AspirasiReplyCodec.parseAndStrip(tanggapanPengurus)
+        return AspirasiItem(
+            id = id,
+            tanggal = tanggal,
+            nama = nama,
+            kategori = kategori.ifBlank { "Masukan/Saran" },
+            pesan = pesan,
+            fotoMasalah = AspirasiSheetColumns.splitPhotoSlots(fotoMasalah).joinToString(","),
+            status = status.ifBlank { "Menunggu" },
+            penanggapNama = penanggapNama.ifBlank { parsedMeta.penanggapNama },
+            tanggapanPengurus = parsedMeta.cleanTanggapan,
+            fotoPengerjaan = AspirasiSheetColumns.splitPhotoSlots(fotoPengerjaan).joinToString(","),
+            noRumah = noRumah,
+            sembunyikanNama = sembunyikanNama,
+            penanggapUsername = penanggapUsername,
+            penanggapNamaAsli = penanggapNamaAsli,
+            penanggapPeran = penanggapPeran.ifBlank { parsedMeta.penanggapPeran },
+            waktuTanggapan = waktuTanggapan.ifBlank { parsedMeta.waktuTanggapan }
+        )
+    }
 
     companion object {
         const val SYNC_STATUS_SYNCED = "SYNCED"
@@ -45,12 +60,17 @@ data class AspirasiEntity(
             nama = item.nama,
             noRumah = item.noRumah,
             sembunyikanNama = item.sembunyikanNama,
-            kategori = item.kategori,
+            kategori = item.kategori.ifBlank { "Masukan/Saran" },
             pesan = item.pesan,
-            fotoMasalah = item.fotoMasalah,
-            status = item.status,
-            tanggapanPengurus = item.tanggapanPengurus,
-            fotoPengerjaan = item.fotoPengerjaan,
+            fotoMasalah = AspirasiSheetColumns.splitPhotoSlots(item.fotoMasalah).joinToString(","),
+            status = item.status.ifBlank { "Menunggu" },
+            tanggapanPengurus = AspirasiReplyCodec.stripMarker(item.tanggapanPengurus),
+            fotoPengerjaan = AspirasiSheetColumns.splitPhotoSlots(item.fotoPengerjaan).joinToString(","),
+            penanggapNama = item.penanggapNama,
+            penanggapUsername = item.penanggapUsername,
+            penanggapNamaAsli = item.penanggapNamaAsli,
+            penanggapPeran = item.penanggapPeran,
+            waktuTanggapan = item.waktuTanggapan,
             syncStatus = status
         )
     }

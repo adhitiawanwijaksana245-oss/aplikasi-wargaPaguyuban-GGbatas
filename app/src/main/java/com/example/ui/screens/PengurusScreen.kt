@@ -71,26 +71,27 @@ fun PengurusScreen(
                             color = TextSecondary
                         )
                     }
+                    val isAdmin = userRole == UserRole.ADMIN_UTAMA
                     Surface(
                         shape = RoundedCornerShape(10.dp),
-                        color = if (userRole == UserRole.WARGA) SkySoft else Color(0xFFDCFCE7)
+                        color = if (isAdmin) Color(0xFFDCFCE7) else SkySoft
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                         ) {
                             Icon(
-                                imageVector = if (userRole == UserRole.WARGA) Icons.Outlined.Lock else Icons.Filled.VerifiedUser,
+                                imageVector = if (isAdmin) Icons.Filled.VerifiedUser else Icons.Outlined.Lock,
                                 contentDescription = null,
-                                tint = if (userRole == UserRole.WARGA) NavyPrimary else Color(0xFF166534),
+                                tint = if (isAdmin) Color(0xFF166534) else NavyPrimary,
                                 modifier = Modifier.size(14.dp)
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = if (userRole == UserRole.WARGA) "Edit Terkunci" else "Akses Terbuka",
+                                text = if (isAdmin) "Akses Terbuka" else "Edit Terkunci",
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = if (userRole == UserRole.WARGA) NavyPrimary else Color(0xFF166534)
+                                color = if (isAdmin) Color(0xFF166534) else NavyPrimary
                             )
                         }
                     }
@@ -237,23 +238,22 @@ fun PengurusScreen(
                                     }
                                 }
 
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    // Tombol Edit selalu tersedia & diproteksi password otoritas 005011 saat Mode Warga
-                                    IconButton(
-                                        onClick = { onEditPengurusClick(item) },
-                                        modifier = Modifier
-                                            .size(48.dp)
-                                            .testTag("edit_pengurus_${item.id}")
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Outlined.Edit,
-                                            contentDescription = "Edit Pengurus",
-                                            tint = AccentBlue,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                    }
-                                    if (userRole != UserRole.WARGA) {
+                                if (userRole == UserRole.ADMIN_UTAMA) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        IconButton(
+                                            onClick = { onEditPengurusClick(item) },
+                                            modifier = Modifier
+                                                .size(48.dp)
+                                                .testTag("edit_pengurus_${item.id}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Outlined.Edit,
+                                                contentDescription = "Edit Pengurus",
+                                                tint = AccentBlue,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
                                         IconButton(
                                             onClick = { onDeletePengurusClick(item.id) },
                                             modifier = Modifier
@@ -280,18 +280,20 @@ fun PengurusScreen(
             }
         }
 
-        // FAB to Add Officer (Auth-protected)
-        FloatingActionButton(
-            onClick = onAddPengurusClick,
-            containerColor = NavyPrimary,
-            contentColor = Color.White,
-            shape = CircleShape,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp)
-                .testTag("add_pengurus_fab")
-        ) {
-            Icon(Icons.Filled.PersonAdd, contentDescription = "Tambah Pengurus")
+        // FAB to Add Officer (Strictly Admin only)
+        if (userRole == UserRole.ADMIN_UTAMA) {
+            FloatingActionButton(
+                onClick = onAddPengurusClick,
+                containerColor = NavyPrimary,
+                contentColor = Color.White,
+                shape = CircleShape,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(20.dp)
+                    .testTag("add_pengurus_fab")
+            ) {
+                Icon(Icons.Filled.PersonAdd, contentDescription = "Tambah Pengurus")
+            }
         }
 
         if (previewPhotoModel != null) {

@@ -34,8 +34,13 @@ object KasRecapHelper {
     private val REGEX_NAMED_MONTH = Regex("^(?:\\d{1,2}\\s+)?([A-Za-z]+)\\s+(\\d{4})$")
 
     fun parseMonthKey(raw: String?): String {
-        val trimmed = raw?.trim().orEmpty()
-        if (trimmed.isBlank()) return ""
+        val rawTrimmed = raw?.trim().orEmpty()
+        if (rawTrimmed.isBlank()) return ""
+        val trimmed = if (rawTrimmed.contains("T")) {
+            IndonesianDateHelper.toIsoDate(rawTrimmed).ifBlank { rawTrimmed }
+        } else {
+            rawTrimmed
+        }
 
         REGEX_YYYY_MM_PREFIX.matchEntire(trimmed)?.let { m ->
             val year = m.groupValues[1].toIntOrNull() ?: return ""
@@ -277,11 +282,11 @@ object KasRecapHelper {
 
     fun buildTimelineRecap(
         sourceRecap: List<KasMonthlyRecap>,
-        startKey: String = "2026-01",
+        startKey: String = "2025-12",
         minEndKey: String = "2030-12"
     ): List<KasMonthlyRecap> {
         val sorted = recomputeRunningSaldos(normalizeRecapList(sourceRecap))
-        val normStart = parseMonthKey(startKey).ifBlank { "2026-01" }
+        val normStart = parseMonthKey(startKey).ifBlank { "2025-12" }
         val normMinEnd = parseMonthKey(minEndKey).ifBlank { "2030-12" }
         val latestDataKey = sorted.lastOrNull()?.periodeBulan.orEmpty()
         val effectiveEnd = if (latestDataKey.isNotBlank() && latestDataKey > normMinEnd) {
@@ -352,5 +357,77 @@ object KasRecapHelper {
             )
         }
         return remoteSummary ?: KasSummaryTotals()
+    }
+
+    data class KasPeriodSummary(
+        val saldoAwal: Long = 0L,
+        val totalMasuk: Long = 0L,
+        val totalKeluar: Long = 0L,
+        val saldoAkhir: Long = 0L
+    )
+
+    fun buildAvailableMonthKeys(
+        kasList: List<KasItem>,
+        rekapBulanan: List<KasMonthlyRecap>,
+        startKey: String = "2025-12",
+        endKey: String = "2030-12"
+    ): List<String> {
+        val baseRange = monthKeyRange(startKey, endKey)
+        val fromKas = kasList.mapNotNull { item ->
+            resolvePeriodeKey(item.periodeBulan, item.tanggal).takeIf { it.isNotBlank() }
+        }
+        val fromRekap = rekapBulanan.mapNotNull { recap ->
+            parseMonthKey(recap.periodeBulan.ifBlank { recap.labelBulan }).takeIf { it.isNotBlank() }
+        }
+        val allOrdered = (baseRange + fromKas + fromRekap).distinct().sorted()
+        return listOf("Semua") + allOrdered
+    }
+
+    fun computePeriodSummary(
+        selectedMonthKey: String,
+        kasList: List<KasItem>,
+        rekapBulanan: List<KasMonthlyRecap>,
+        overallTotals: KasSummaryTotals
+    ): KasPeriodSummary {
+        if (selectedMonthKey == "Semua") {
+            return KasPeriodSummary(
+                saldoAwal = 0L,
+                totalMasuk = overallTotals.totalMasuk,
+                totalKeluar = overallTotals.totalKeluar,
+                saldoAkhir = overallTotals.saldoKas
+            )
+        }
+
+        val localByMonth = buildFullMonthlyRecap(kasList).associateBy { it.periodeBulan }
+        val mergedByMonth = linkedMapOf<String, KasMonthlyRecap>()
+        normalizeRecapList(rekapBulanan).forEach { mergedByMonth[it.periodeBulan] = it }
+        localByMonth.forEach { (key, value) -> mergedByMonth[key] = value }
+
+        val saldoAwal = mergedByMonth.values
+            .filter { it.periodeBulan < selectedMonthKey }
+            .sumOf { it.totalMasuk - it.totalKeluar }
+
+        val selectedMonthItems = kasList.filter { item ->
+            resolvePeriodeKey(item.periodeBulan, item.tanggal) == selectedMonthKey
+        }
+        val selectedRecap = mergedByMonth[selectedMonthKey]
+
+        val masukBulan = if (selectedMonthItems.isNotEmpty()) {
+            selectedMonthItems.sumOf { it.masuk }
+        } else {
+            selectedRecap?.totalMasuk ?: 0L
+        }
+        val keluarBulan = if (selectedMonthItems.isNotEmpty()) {
+            selectedMonthItems.sumOf { it.keluar }
+        } else {
+            selectedRecap?.totalKeluar ?: 0L
+        }
+
+        return KasPeriodSummary(
+            saldoAwal = saldoAwal,
+            totalMasuk = masukBulan,
+            totalKeluar = keluarBulan,
+            saldoAkhir = saldoAwal + masukBulan - keluarBulan
+        )
     }
 }

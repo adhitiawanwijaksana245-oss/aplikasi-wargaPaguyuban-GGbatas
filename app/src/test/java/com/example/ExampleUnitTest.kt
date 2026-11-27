@@ -17,8 +17,8 @@ class ExampleUnitTest {
   }
 
   @Test
-  fun default_authority_password_is_005011() {
-    assertEquals("005011", WargaRepository.DEFAULT_PASSWORD)
+  fun admin_authority_password_is_080309() {
+    assertEquals("080309", WargaRepository.ADMIN_UTAMA_PASSWORD)
   }
 
   @Test
@@ -63,13 +63,23 @@ class ExampleUnitTest {
       nama = "Bpk. Santoso",
       kategori = "Masukan/Saran",
       pesan = "Usulan kerja bakti",
-      status = "Menunggu"
+      status = "Selesai",
+      tanggapanPengurus = "Sudah dijadwalkan",
+      penanggapNama = "Tim Kebersihan",
+      penanggapUsername = "budi_rt05",
+      penanggapNamaAsli = "Budi Santoso"
     )
     val entity = com.example.data.local.AspirasiEntity.fromAspirasiItem(aspirasiItem)
     assertEquals("ASP-999", entity.id)
     assertEquals("Bpk. Santoso", entity.nama)
+    assertEquals("Tim Kebersihan", entity.penanggapNama)
+    assertEquals("budi_rt05", entity.penanggapUsername)
+    assertEquals("Budi Santoso", entity.penanggapNamaAsli)
 
     val backToItem = entity.toAspirasiItem()
     assertEquals(aspirasiItem.pesan, backToItem.pesan)
+    assertEquals(aspirasiItem.penanggapNama, backToItem.penanggapNama)
+    assertEquals(aspirasiItem.penanggapUsername, backToItem.penanggapUsername)
+    assertEquals(aspirasiItem.penanggapNamaAsli, backToItem.penanggapNamaAsli)
   }
 }

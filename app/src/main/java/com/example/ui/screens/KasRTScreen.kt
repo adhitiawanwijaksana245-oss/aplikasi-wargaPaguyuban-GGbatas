@@ -26,15 +26,14 @@ import androidx.compose.ui.unit.sp
 import coil.compose.SubcomposeAsyncImage
 import com.example.data.model.KasItem
 import com.example.data.model.KasMonthlyRecap
+import com.example.data.model.KasSummaryTotals
 import com.example.data.model.UserRole
 import com.example.ui.components.KasGroupedBarChartCard
 import com.example.ui.components.KasRolling12LineChartCard
 import com.example.ui.theme.*
 import com.example.ui.viewmodel.WargaViewModel
+import com.example.util.IndonesianDateHelper
 import com.example.util.KasRecapHelper
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 @Composable
 fun KasRTScreen(
@@ -64,35 +63,29 @@ fun KasRTScreen(
     }
 
     val effectiveBarRecap = remember(baseTimelineSource) {
-        if (baseTimelineSource.isNotEmpty()) {
-            KasRecapHelper.buildTimelineRecap(
-                sourceRecap = baseTimelineSource,
-                startKey = "2026-01",
-                minEndKey = "2030-12"
-            )
-        } else {
-            emptyList()
-        }
+        KasRecapHelper.buildTimelineRecap(
+            sourceRecap = baseTimelineSource,
+            startKey = "2025-12",
+            minEndKey = "2030-12"
+        )
     }
 
     val effectiveLineRecap = remember(baseTimelineSource) {
         KasRecapHelper.buildTimelineRecap(
             sourceRecap = baseTimelineSource,
-            startKey = "2026-01",
+            startKey = "2025-12",
             minEndKey = "2030-12"
         )
     }
 
-    // Extract all distinct months from both transaction history and rekapBulanan (sorted descending)
+    // Chronological months starting from Desember 2025 to Desember 2030
     val availableMonthKeys = remember(kasList, rekapBulanan) {
-        val fromKas = kasList.mapNotNull { item ->
-            KasRecapHelper.resolvePeriodeKey(item.periodeBulan, item.tanggal).takeIf { it.isNotBlank() }
-        }
-        val fromRekap = rekapBulanan.mapNotNull { recap ->
-            KasRecapHelper.parseMonthKey(recap.periodeBulan.ifBlank { recap.labelBulan }).takeIf { it.isNotBlank() }
-        }
-        val keys = (fromKas + fromRekap).distinct().sortedDescending()
-        listOf("Semua") + keys
+        KasRecapHelper.buildAvailableMonthKeys(
+            kasList = kasList,
+            rekapBulanan = rekapBulanan,
+            startKey = "2025-12",
+            endKey = "2030-12"
+        )
     }
 
     // Filter by Month using periodeBulan or tanggal
@@ -106,29 +99,20 @@ fun KasRTScreen(
         }
     }
 
-    val selectedMonthRecap = remember(rekapBulanan, selectedMonthKey) {
-        if (selectedMonthKey == "Semua") null
-        else rekapBulanan.firstOrNull { it.periodeBulan == selectedMonthKey }
+    // Summary totals with Saldo Awal carry-forward per month
+    val periodSummary = remember(selectedMonthKey, kasList, rekapBulanan, saldoKas, totalMasuk, totalKeluar) {
+        KasRecapHelper.computePeriodSummary(
+            selectedMonthKey = selectedMonthKey,
+            kasList = kasList,
+            rekapBulanan = rekapBulanan,
+            overallTotals = KasSummaryTotals(
+                saldoKas = saldoKas,
+                totalMasuk = totalMasuk,
+                totalKeluar = totalKeluar
+            )
+        )
     }
-
-    // Monthly totals for report (Semua Periode stays identical to Beranda totals)
-    val displayMasuk = remember(monthFilteredList, selectedMonthRecap, selectedMonthKey, totalMasuk) {
-        when {
-            selectedMonthKey == "Semua" -> totalMasuk
-            monthFilteredList.isNotEmpty() -> monthFilteredList.sumOf { it.masuk }
-            else -> selectedMonthRecap?.totalMasuk ?: 0L
-        }
-    }
-    val displayKeluar = remember(monthFilteredList, selectedMonthRecap, selectedMonthKey, totalKeluar) {
-        when {
-            selectedMonthKey == "Semua" -> totalKeluar
-            monthFilteredList.isNotEmpty() -> monthFilteredList.sumOf { it.keluar }
-            else -> selectedMonthRecap?.totalKeluar ?: 0L
-        }
-    }
-    val displaySaldo = remember(displayMasuk, displayKeluar, selectedMonthKey, saldoKas) {
-        if (selectedMonthKey == "Semua") saldoKas else (displayMasuk - displayKeluar)
-    }
+    val arusKasBulan = periodSummary.totalMasuk - periodSummary.totalKeluar
 
     val finalFilteredList = remember(monthFilteredList, searchQuery, filterType) {
         monthFilteredList.filter { item ->
@@ -228,7 +212,7 @@ fun KasRTScreen(
                 }
             }
 
-            // AREA DI BAWAH GRAFIK: 3 Kartu Ringkasan Nominal Horizontal (Total Masuk, Total Keluar, Saldo Akhir)
+            // AREA DI BAWAH GRAFIK: 4 Kartu Ringkasan Nominal Horizontal (Saldo Awal, Total Masuk, Total Keluar, Saldo Akhir)
             item {
                 val periodCaption = if (selectedMonthKey == "Semua") {
                     "Semua Periode"
@@ -242,11 +226,24 @@ fun KasRTScreen(
                         .testTag("kas_summary_cards_row"),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // 1. Total Masuk
+                    // 1. Saldo Awal
+                    KasHorizontalSummaryCard(
+                        title = "Saldo Awal",
+                        subtitle = periodCaption,
+                        amount = periodSummary.saldoAwal,
+                        icon = Icons.Outlined.AccountBalance,
+                        containerColor = Color(0xFFF1F5F9),
+                        iconContainerColor = Color(0xFFE2E8F0),
+                        accentColor = if (periodSummary.saldoAwal >= 0L) NavyPrimary else RedExpense,
+                        titleColor = NavyPrimary,
+                        modifier = Modifier.testTag("kas_card_saldo_awal")
+                    )
+
+                    // 2. Total Masuk
                     KasHorizontalSummaryCard(
                         title = "Total Masuk",
                         subtitle = periodCaption,
-                        amount = displayMasuk,
+                        amount = periodSummary.totalMasuk,
                         icon = Icons.Filled.ArrowDownward,
                         containerColor = GreenIncomeBg.copy(alpha = 0.65f),
                         iconContainerColor = Color(0xFFDCFCE7),
@@ -255,11 +252,11 @@ fun KasRTScreen(
                         modifier = Modifier.testTag("kas_card_masuk")
                     )
 
-                    // 2. Total Keluar
+                    // 3. Total Keluar
                     KasHorizontalSummaryCard(
                         title = "Total Keluar",
                         subtitle = periodCaption,
-                        amount = displayKeluar,
+                        amount = periodSummary.totalKeluar,
                         icon = Icons.Filled.ArrowUpward,
                         containerColor = RedExpenseBg.copy(alpha = 0.65f),
                         iconContainerColor = Color(0xFFFEE2E2),
@@ -268,15 +265,15 @@ fun KasRTScreen(
                         modifier = Modifier.testTag("kas_card_keluar")
                     )
 
-                    // 3. Saldo Akhir
+                    // 4. Saldo Akhir
                     KasHorizontalSummaryCard(
                         title = "Saldo Akhir",
                         subtitle = periodCaption,
-                        amount = displaySaldo,
+                        amount = periodSummary.saldoAkhir,
                         icon = Icons.Filled.AccountBalanceWallet,
                         containerColor = SurfaceCard,
                         iconContainerColor = SkySoft,
-                        accentColor = if (displaySaldo >= 0L) NavyPrimary else RedExpense,
+                        accentColor = if (periodSummary.saldoAkhir >= 0L) NavyPrimary else RedExpense,
                         titleColor = NavyPrimary,
                         modifier = Modifier.testTag("kas_card_saldo")
                     )
@@ -373,9 +370,9 @@ fun KasRTScreen(
                                         fontWeight = FontWeight.Medium
                                     )
                                     Text(
-                                        text = "${if (displaySaldo >= 0) "+ " else ""}${WargaViewModel.formatRupiah(displaySaldo)}",
+                                        text = "${if (arusKasBulan >= 0) "+ " else ""}${WargaViewModel.formatRupiah(arusKasBulan)}",
                                         fontSize = 12.sp,
-                                        color = if (displaySaldo >= 0) Color(0xFF166534) else RedExpense,
+                                        color = if (arusKasBulan >= 0) Color(0xFF166534) else RedExpense,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
@@ -417,7 +414,11 @@ fun KasRTScreen(
                         color = if (userRole == UserRole.WARGA) SkySoft else Color(0xFFDCFCE7)
                     ) {
                         Text(
-                            text = if (userRole == UserRole.WARGA) "Mode Baca (Warga)" else "Mode Kelola (Pengurus)",
+                            text = when (userRole) {
+                                UserRole.WARGA -> "Mode Baca (Warga)"
+                                UserRole.PENGURUS -> "Mode Kelola (Pengurus)"
+                                UserRole.ADMIN_UTAMA -> "Mode Kelola (Admin)"
+                            },
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Medium,
                             color = if (userRole == UserRole.WARGA) NavyPrimary else Color(0xFF166534),
@@ -462,18 +463,20 @@ fun KasRTScreen(
             }
         }
 
-        // Floating Action Button to Add Transaction
-        FloatingActionButton(
-            onClick = onAddKasClick,
-            containerColor = NavyPrimary,
-            contentColor = Color.White,
-            shape = CircleShape,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp)
-                .testTag("add_kas_fab")
-        ) {
-            Icon(Icons.Filled.Add, contentDescription = "Tambah Transaksi Kas RT")
+        // Floating Action Button to Add Transaction (Hidden in Warga mode)
+        if (userRole != UserRole.WARGA) {
+            FloatingActionButton(
+                onClick = onAddKasClick,
+                containerColor = NavyPrimary,
+                contentColor = Color.White,
+                shape = CircleShape,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(20.dp)
+                    .testTag("add_kas_fab")
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = "Tambah Transaksi Kas RT")
+            }
         }
     }
 }
@@ -649,8 +652,10 @@ fun KasItemCard(
                         IconButton(onClick = onEdit, modifier = Modifier.size(30.dp)) {
                             Icon(Icons.Outlined.Edit, contentDescription = "Edit", tint = AccentBlue, modifier = Modifier.size(16.dp))
                         }
-                        IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
-                            Icon(Icons.Outlined.Delete, contentDescription = "Hapus", tint = RedExpense, modifier = Modifier.size(16.dp))
+                        if (userRole == UserRole.ADMIN_UTAMA) {
+                            IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
+                                Icon(Icons.Outlined.Delete, contentDescription = "Hapus", tint = RedExpense, modifier = Modifier.size(16.dp))
+                            }
                         }
                     }
                 }
@@ -734,21 +739,5 @@ private fun KasHorizontalSummaryCard(
 }
 
 private fun formatKasDate(dateStr: String): String {
-    return try {
-        if (dateStr.contains("T")) {
-            val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
-            val date = iso.parse(dateStr.substringBefore("."))
-            val out = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale("id", "ID"))
-            out.format(date ?: Date())
-        } else if (dateStr.length >= 10 && dateStr.contains("-")) {
-            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-            val date = sdf.parse(dateStr.substring(0, 10))
-            val out = SimpleDateFormat("dd MMM yyyy", Locale("id", "ID"))
-            out.format(date ?: Date())
-        } else {
-            dateStr
-        }
-    } catch (e: Exception) {
-        dateStr
-    }
+    return IndonesianDateHelper.formatShortDate(dateStr)
 }
